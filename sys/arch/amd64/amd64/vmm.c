@@ -3157,7 +3157,8 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 		goto exit;
 	}
 
-	if (vmwrite(VMCS_CR0_MASK, CR0_NE)) {
+	if (vmwrite(VMCS_CR0_MASK, 
+	    vcpu->vc_vmx_cr0_fixed1 | vcpu->vc_vmx_cr0_fixed0)) {
 		DPRINTF("%s: error setting guest CR0 mask\n", __func__);
 		ret = EINVAL;
 		goto exit;
@@ -3188,7 +3189,13 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 	vmx_setmsrbrw(vcpu, MSR_KERNELGSBASE);
 	vmx_setmsrbr(vcpu, MSR_MISC_ENABLE);
 
-	/* XXX CR0 shadow */
+	/* 9.1.1 Processor State After Reset, cr0 default value */
+	if (vmwrite(VMCS_CR0_READ_SHADOW, 0x60000010)) {
+		DPRINTF("%s: error setting guest CR0 read shadow\n", __func__);
+		ret = EINVAL;
+		goto exit;
+	}
+
 	/* XXX CR4 shadow */
 
 	/* xcr0 power on default sets bit 0 (x87 state) */
@@ -5985,32 +5992,11 @@ exit:
 int
 vmx_handle_cr0_write(struct vcpu *vcpu, uint64_t r)
 {
+	printf("%s\n",__func__);
 	struct vmx_msr_store *msr_store;
 	struct vmx_invvpid_descriptor vid;
-	uint64_t ectls, oldcr0, cr4, mask;
+	uint64_t ectls, oldcr0, cr4;
 	int ret;
-
-	/* Check must-be-0 bits */
-	mask = vcpu->vc_vmx_cr0_fixed1;
-	if (~r & mask) {
-		/* Inject #GP, let the guest handle it */
-		DPRINTF("%s: guest set invalid bits in %%cr0. Zeros "
-		    "mask=0x%llx, data=0x%llx\n", __func__,
-		    vcpu->vc_vmx_cr0_fixed1, r);
-		vmm_inject_gp(vcpu);
-		return (0);
-	}
-
-	/* Check must-be-1 bits */
-	mask = vcpu->vc_vmx_cr0_fixed0;
-	if ((r & mask) != mask) {
-		/* Inject #GP, let the guest handle it */
-		DPRINTF("%s: guest set invalid bits in %%cr0. Ones "
-		    "mask=0x%llx, data=0x%llx\n", __func__,
-		    vcpu->vc_vmx_cr0_fixed0, r);
-		vmm_inject_gp(vcpu);
-		return (0);
-	}
 
 	if (r & 0xFFFFFFFF00000000ULL) {
 		DPRINTF("%s: setting bits 63:32 of %%cr0 is invalid,"
@@ -6038,10 +6024,13 @@ vmx_handle_cr0_write(struct vcpu *vcpu, uint64_t r)
 		return (EINVAL);
 	}
 
-	/* CR0 must always have NE set */
-	r |= CR0_NE;
+	if (vmwrite(VMCS_CR0_READ_SHADOW, r)) {
+		printf("%s: can't write guest cr0 read shadow\n", __func__);
+		return (EINVAL);
+	}
 
-	if (vmwrite(VMCS_GUEST_IA32_CR0, r)) {
+	if (vmwrite(VMCS_GUEST_IA32_CR0,
+	    (r | vcpu->vc_vmx_cr0_fixed1) & (~vcpu->vc_vmx_cr0_fixed0))) {
 		printf("%s: can't write guest cr0\n", __func__);
 		return (EINVAL);
 	}
