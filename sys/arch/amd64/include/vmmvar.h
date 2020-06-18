@@ -961,6 +961,8 @@ struct vcpu {
 	uint8_t vc_vmx_vpid_enabled;
 	uint64_t vc_vmx_cr0_fixed1;
 	uint64_t vc_vmx_cr0_fixed0;
+	uint64_t vc_vmx_cr4_fixed1;
+	uint64_t vc_vmx_cr4_fixed0;
 
 	/* SVM only */
 	vaddr_t vc_svm_hsa_va;

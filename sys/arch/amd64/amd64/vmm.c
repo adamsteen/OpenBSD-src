@@ -3017,6 +3017,9 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 		goto exit;
 	}
 
+	vcpu->vc_vmx_cr4_fixed1 = want1;
+	vcpu->vc_vmx_cr4_fixed0 = want0;
+
 	cr3 = vrs->vrs_crs[VCPU_REGS_CR3];
 
 	/* Restore PDPTEs if 32-bit PAE paging is being used */
@@ -3151,15 +3154,16 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 		goto exit;
 	}
 
-	if (vmwrite(VMCS_CR4_MASK, CR4_VMXE)) {
-		DPRINTF("%s: error setting guest CR4 mask\n", __func__);
+	if (vmwrite(VMCS_CR0_MASK, 
+	    vcpu->vc_vmx_cr0_fixed1 | vcpu->vc_vmx_cr0_fixed0)) {
+		DPRINTF("%s: error setting guest CR0 mask\n", __func__);
 		ret = EINVAL;
 		goto exit;
 	}
 
-	if (vmwrite(VMCS_CR0_MASK, 
-	    vcpu->vc_vmx_cr0_fixed1 | vcpu->vc_vmx_cr0_fixed0)) {
-		DPRINTF("%s: error setting guest CR0 mask\n", __func__);
+	if (vmwrite(VMCS_CR4_MASK, 
+	    vcpu->vc_vmx_cr4_fixed1 | vcpu->vc_vmx_cr4_fixed0)) {
+		DPRINTF("%s: error setting guest CR4 mask\n", __func__);
 		ret = EINVAL;
 		goto exit;
 	}
@@ -3196,7 +3200,12 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 		goto exit;
 	}
 
-	/* XXX CR4 shadow */
+	/* 9.1.1 Processor State After Reset, cr4 default value */
+	if (vmwrite(VMCS_CR4_READ_SHADOW, 0x00000000)) {
+		DPRINTF("%s: error setting guest CR4 read shadow\n", __func__);
+		ret = EINVAL;
+		goto exit;
+	}
 
 	/* xcr0 power on default sets bit 0 (x87 state) */
 	vcpu->vc_gueststate.vg_xcr0 = XCR0_X87 & xsave_mask;
@@ -5992,7 +6001,6 @@ exit:
 int
 vmx_handle_cr0_write(struct vcpu *vcpu, uint64_t r)
 {
-	printf("%s\n",__func__);
 	struct vmx_msr_store *msr_store;
 	struct vmx_invvpid_descriptor vid;
 	uint64_t ectls, oldcr0, cr4;
@@ -6103,36 +6111,20 @@ vmx_handle_cr0_write(struct vcpu *vcpu, uint64_t r)
 int
 vmx_handle_cr4_write(struct vcpu *vcpu, uint64_t r)
 {
-	uint64_t mask;
-
-	/* Check must-be-0 bits */
-	mask = ~(curcpu()->ci_vmm_cap.vcc_vmx.vmx_cr4_fixed1);
-	if (r & mask) {
-		/* Inject #GP, let the guest handle it */
-		DPRINTF("%s: guest set invalid bits in %%cr4. Zeros "
-		    "mask=0x%llx, data=0x%llx\n", __func__,
-		    curcpu()->ci_vmm_cap.vcc_vmx.vmx_cr4_fixed1,
-		    r);
+	if (r & 0xFFFFFFFF00000000ULL) {
+		DPRINTF("%s: setting bits 63:32 of %%cr4 is invalid,"
+		    " inject #GP, cr4=0x%llx\n", __func__, r);
 		vmm_inject_gp(vcpu);
 		return (0);
 	}
 
-	/* Check must-be-1 bits */
-	mask = curcpu()->ci_vmm_cap.vcc_vmx.vmx_cr4_fixed0;
-	if ((r & mask) != mask) {
-		/* Inject #GP, let the guest handle it */
-		DPRINTF("%s: guest set invalid bits in %%cr4. Ones "
-		    "mask=0x%llx, data=0x%llx\n", __func__,
-		    curcpu()->ci_vmm_cap.vcc_vmx.vmx_cr4_fixed0,
-		    r);
-		vmm_inject_gp(vcpu);
-		return (0);
+	if (vmwrite(VMCS_CR4_READ_SHADOW, r)) {
+		printf("%s: can't write guest cr4 read shadow\n", __func__);
+		return (EINVAL);
 	}
 
-	/* CR4_VMXE must always be enabled */
-	r |= CR4_VMXE;
-
-	if (vmwrite(VMCS_GUEST_IA32_CR4, r)) {
+	if (vmwrite(VMCS_GUEST_IA32_CR4,
+	    (r | vcpu->vc_vmx_cr4_fixed1) & (~vcpu->vc_vmx_cr4_fixed0))) {
 		printf("%s: can't write guest cr4\n", __func__);
 		return (EINVAL);
 	}
