@@ -3322,6 +3322,12 @@ vcpu_init_vmx(struct vcpu *vcpu)
 		goto exit;
 	}
 
+	if (vmwrite(VMCS_HOST_IA32_RIP, (uint64_t)&vmx_exit_handler)) {
+		DPRINTF("%s: error writing host RIP\n", __func__);
+		ret = EINVAL;
+		goto exit;
+	}
+
 	/* Host CR0 */
 	cr0 = rcr0() & ~CR0_TS;
 	if (vmwrite(VMCS_HOST_IA32_CR0, cr0)) {

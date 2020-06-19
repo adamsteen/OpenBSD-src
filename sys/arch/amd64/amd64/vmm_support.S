@@ -40,6 +40,7 @@
 	.global _C_LABEL(invvpid)
 	.global _C_LABEL(invept)
 	.global _C_LABEL(vmx_enter_guest)
+	.global _C_LABEL(vmx_exit_handler)
 	.global _C_LABEL(vmm_dispatch_intr)
 	.global _C_LABEL(svm_enter_guest)
 
@@ -168,14 +169,6 @@ _C_LABEL(vmx_enter_guest):
 	movq	%rcx, %r9	/* L1DF MSR support */
 	testq	%r8, %r8
 	jnz skip_init
-
-	/*
-	 * XXX make vmx_exit_handler a global and put this in the per-vcpu
-	 * init code
-	 */
-	movq	$VMCS_HOST_IA32_RIP, %rdi
-	movq	$vmx_exit_handler_asm, %rax
-	vmwrite %rax, %rdi	/* Host RIP */
 
 skip_init:
 	/*
@@ -423,7 +416,7 @@ fail_launch_valid_vmcs:
 	movq	$VMX_FAIL_LAUNCH_VALID_VMCS, %rdi
 	jmp	restore_host
 
-vmx_exit_handler_asm:
+_C_LABEL(vmx_exit_handler):
 	/* Preserve guest registers not saved in VMCS */
 	pushq	%rsi
 	pushq	%rdi

@@ -982,6 +982,7 @@ int	vmread(uint64_t, uint64_t *);
 void	invvpid(uint64_t, struct vmx_invvpid_descriptor *);
 void	invept(uint64_t, struct vmx_invept_descriptor *);
 int	vmx_enter_guest(uint64_t *, struct vcpu_gueststate *, int, uint8_t);
+int	vmx_exit_handler(void);
 int	svm_enter_guest(uint64_t, struct vcpu_gueststate *,
     struct region_descriptor *);
 void	start_vmm_on_cpu(struct cpu_info *);
