@@ -41,6 +41,9 @@
 	.global _C_LABEL(invept)
 	.global _C_LABEL(vmx_enter_guest)
 	.global _C_LABEL(vmm_dispatch_intr)
+	.global _C_LABEL(vmx_enter_underjack)
+	.global _C_LABEL(vmx_underjack_set_regs)
+	.global _C_LABEL(vmx_underjack_toggle_stack)
 	.global _C_LABEL(svm_enter_guest)
 
 	.text
@@ -475,6 +478,270 @@ restore_host:
 	popq	%r15
 
 	RETGUARD_POP(r11)
+
+	/*
+	 * Restore saved MSRs
+	 */
+	popq	%rdx
+	popq	%rax
+	movq	$MSR_SFMASK, %rcx
+	wrmsr
+
+	/* XXX - unused? */
+	popq	%rdx
+	popq	%rax
+	movq	$MSR_CSTAR, %rcx
+	wrmsr
+
+	popq	%rdx
+	popq	%rax
+	movq	$MSR_LSTAR, %rcx
+	wrmsr
+
+	popq	%rdx
+	popq	%rax
+	movq	$MSR_STAR, %rcx
+	wrmsr
+
+	/*
+	 * popw %gs will reset gsbase to 0, so preserve it
+	 * first. This is to accommodate possibly lazy-switched
+	 * selectors from above
+	 */
+	popq	%rdx
+	popq	%rax
+	movq	$MSR_KERNELGSBASE, %rcx
+	wrmsr
+
+	popw	%gs
+	popq	%rdx
+	popq	%rax
+	movq	$MSR_GSBASE, %rcx
+	wrmsr
+
+	popw	%fs
+	popq	%rdx
+	popq	%rax
+	movq	$MSR_FSBASE, %rcx
+	wrmsr
+
+	popw	%ax
+	movw	%ax, %ss
+	popw	%ax
+	movw	%ax, %ds
+	popw	%ax
+	movw	%ax, %es
+
+	popfq
+
+	movq	%rdi, %rax
+	RETGUARD_CHECK(vmx_enter_guest, r11)
+<<<<<<< HEAD
+=======
+	ret	
+
+_C_LABEL(vmx_underjack_tramp):
+	ret
+
+_C_LABEL(vmx_underjack_set_regs):
+	movq	%rax, 0x78(%rdi)
+	movq	%cr2, %rax
+	movq	%r15, 0x70(%rdi)
+	movq	%r14, 0x68(%rdi)
+	movq	%r13, 0x60(%rdi)
+	movq	%r12, 0x58(%rdi)
+	movq	%r11, 0x50(%rdi)
+	movq	%r10, 0x48(%rdi)
+	movq	%r9, 0x40(%rdi)
+	movq	%r8, 0x38(%rdi)
+	movq	%rbp, 0x30(%rdi)
+	movq	%rdi, 0x28(%rdi)
+	movq	%rdx, 0x20(%rdi)
+	movq	%rcx, 0x18(%rdi)
+	movq	%rbx, 0x10(%rdi)
+	movq	%rax, 0x08(%rdi)
+	movq	%rsi, 0x00(%rdi)
+
+	/* %rdi discarded at this point */
+	movq	$VMCS_GUEST_IA32_RSP, %rdi
+	movq	%rbp, %rax
+	addq	$0x8, %rax
+	vmwrite %rax, %rdi
+	movq	$VMCS_GUEST_IA32_RIP, %rdi
+	movq	$vmx_underjack_tramp, %rax
+	vmwrite %rax, %rdi
+
+	ret
+
+_C_LABEL(vmx_underjack_toggle_stack):
+	addq	$0xFF8, %rdi
+	movq	(%rsp), %rax
+	movq	%rax, (%rdi)
+	movq	%rdi, %rsp
+	movq	$VMCS_HOST_IA32_RSP, %rdi
+	vmwrite %rsp, %rdi
+  	ret
+
+_C_LABEL(vmx_enter_underjack):
+	movq	$VMCS_HOST_IA32_RIP, %rdi
+	movq	$vmx_uj_exit_handler_asm, %rax
+	vmwrite %rax, %rdi	/* Host RIP */
+
+	movq	$VMCS_GUEST_IA32_RFLAGS, %rdi
+	pushfq
+	popq	%rax
+	vmwrite %rax, %rdi	/* Guest RFLAGS */
+
+	andq	$(~PSL_I), %rax
+	pushq	%rax
+
+	/*
+	 * Save (possibly) lazy-switched selectors
+	 */
+	movw	%es, %ax
+	pushw	%ax
+	movw	%ds, %ax
+	pushw	%ax
+	movw	%ss, %ax
+	pushw	%ax
+
+	movq	$MSR_FSBASE, %rcx
+	rdmsr
+	pushq	%rax
+	pushq	%rdx
+	pushw	%fs
+	movq	$MSR_GSBASE, %rcx
+	rdmsr
+	pushq	%rax
+	pushq	%rdx
+	pushw	%gs
+	movq	$MSR_KERNELGSBASE, %rcx
+	rdmsr
+	pushq	%rax
+	pushq	%rdx
+
+	/*
+	 * Save various MSRs
+	 */
+	movq	$MSR_STAR, %rcx
+	rdmsr
+	pushq	%rax
+	pushq	%rdx
+
+	movq	$MSR_LSTAR, %rcx
+	rdmsr
+	pushq	%rax
+	pushq	%rdx
+
+	/* XXX - unused? */
+	movq	$MSR_CSTAR, %rcx
+	rdmsr
+	pushq	%rax
+	pushq	%rdx
+
+	movq	$MSR_SFMASK, %rcx
+	rdmsr
+	pushq	%rax
+	pushq	%rdx
+
+	/* Preserve callee-preserved registers as per AMD64 ABI */
+	pushq	%r15
+	pushq	%r14
+	pushq	%r13
+	pushq	%r12
+	pushq	%rbp
+	pushq	%rbx
+	pushq	%rsi		/* Guest Regs Pointer */
+
+	movq	$VMCS_HOST_IA32_RSP, %rdi
+	movq	%rsp, %rax
+	vmwrite	%rax, %rdi	/* Host RSP */
+
+	/* Restore guest registers */
+	movq	0x78(%rsi), %rax
+	movq	%rax, %cr2
+	movq	0x70(%rsi), %r15
+	movq	0x68(%rsi), %r14
+	movq	0x60(%rsi), %r13
+	movq	0x58(%rsi), %r12
+	movq	0x50(%rsi), %r11
+	movq	0x48(%rsi), %r10
+	movq	0x40(%rsi), %r9
+	movq	0x38(%rsi), %r8
+	movq	0x30(%rsi), %rbp
+	movq	0x28(%rsi), %rdi
+	movq	0x20(%rsi), %rdx
+	movq	0x18(%rsi), %rcx
+	movq	0x10(%rsi), %rbx
+	movq	0x08(%rsi), %rax
+	movq	0x00(%rsi), %rsi
+
+xxx_last_chance:
+	vmlaunch
+
+fail_launch_uj:
+	/* Failed launch/resume (fell through) */
+	jc fail_launch_invalid_vmcs_uj	/* Invalid VMCS */
+	jz fail_launch_valid_vmcs_uj	/* Valid VMCS, failed launch/resume */
+
+	/* Unknown failure mode (not documented as per Intel SDM) */
+fail_launch_unknown_uj:
+	movq	$VMX_FAIL_LAUNCH_UNKNOWN, %rdi
+	popq	%rsi
+	jmp	restore_host_uj
+
+fail_launch_invalid_vmcs_uj:
+	movq	$VMX_FAIL_LAUNCH_INVALID_VMCS, %rdi
+	popq	%rsi
+	jmp	restore_host_uj
+
+fail_launch_valid_vmcs_uj:
+	movq	$VMCS_INSTRUCTION_ERROR, %rdi
+	popq	%rsi
+	vmread	%rdi, %rax
+	/* XXX check failure of vmread */
+	movl	%eax, 0x80(%rsi)
+	movq	$VMX_FAIL_LAUNCH_VALID_VMCS, %rdi
+	jmp	restore_host_uj
+
+vmx_uj_exit_handler_asm:
+	/* Preserve host registers not saved in VMCS */
+	pushq	%rsi
+	pushq	%rdi
+	movq	0x10(%rsp), %rdi
+	movq	0x8(%rsp), %rsi
+	movq	%rsi, (%rdi)
+	popq	%rdi
+	popq	%rsi	/* discard */
+
+	popq	%rsi
+	movq	%rax, 0x8(%rsi)
+	movq	%rbx, 0x10(%rsi)
+	movq	%rcx, 0x18(%rsi)
+	movq	%rdx, 0x20(%rsi)
+	movq	%rdi, 0x28(%rsi)
+	movq	%rbp, 0x30(%rsi)
+	movq	%r8, 0x38(%rsi)
+	movq	%r9, 0x40(%rsi)
+	movq	%r10, 0x48(%rsi)
+	movq	%r11, 0x50(%rsi)
+	movq	%r12, 0x58(%rsi)
+	movq	%r13, 0x60(%rsi)
+	movq	%r14, 0x68(%rsi)
+	movq	%r15, 0x70(%rsi)
+	movq	%cr2, %rax
+	movq	%rax, 0x78(%rsi)
+
+	/* %rdi = 0 means we took an exit */
+	xorq	%rdi, %rdi
+
+restore_host_uj:
+	popq	%rbx
+	popq	%rbp
+	popq	%r12
+	popq	%r13
+	popq	%r14
+	popq	%r15
 
 	/*
 	 * Restore saved MSRs

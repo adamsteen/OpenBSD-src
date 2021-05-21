@@ -65,6 +65,7 @@
 
 #include "ioapic.h"
 #include "lapic.h"
+#include "vmm.h"
 
 #if NIOAPIC > 0
 #include <machine/i82093var.h>

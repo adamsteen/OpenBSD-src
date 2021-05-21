@@ -20,6 +20,7 @@
 #include <sys/signalvar.h>
 #include <sys/malloc.h>
 #include <sys/device.h>
+#include <sys/kcore.h>
 #include <sys/pool.h>
 #include <sys/proc.h>
 #include <sys/user.h>
@@ -92,6 +93,11 @@ struct vmm_softc {
 	uint32_t		nr_svm_cpus;
 	uint32_t		nr_rvi_cpus;
 	uint32_t		nr_ept_cpus;
+
+	/* Underjack */
+	uint8_t			vmm_uj;		/* 1 if underjack configured */
+	struct pmap		vmm_uj_pmap;
+	struct vcpu		vmm_uj_vcpu;	/* XXX SMP */
 
 	/* Managed VMs */
 	struct vmlist_head	vm_list;
@@ -209,6 +215,11 @@ void vmm_init_pvclock(struct vcpu *, paddr_t);
 int vmm_update_pvclock(struct vcpu *);
 int vmm_pat_is_valid(uint64_t);
 
+int vmm_init_underjack(void);
+void vmm_do_underjack(void);
+int vmx_handle_underjack_exit(void);
+int vmx_handle_np_uj_fault(struct vcpu *);
+
 #ifdef VMM_DEBUG
 void dump_vcpu(struct vcpu *);
 void vmx_vcpu_dump_regs(struct vcpu *);
@@ -297,6 +308,10 @@ struct vmm_softc *vmm_softc;
 /* IDT information used when populating host state area */
 extern vaddr_t idt_vaddr;
 extern struct gate_descriptor *idt;
+
+/* memory size description used in constructing underjack EPT */
+extern int mem_cluster_cnt;				/* machdep.c */
+extern phys_ram_seg_t mem_clusters[VM_PHYSSEG_MAX];	/* machdep.c */
 
 /* Constants used in "CR access exit" */
 #define CR_WRITE	0
@@ -398,6 +413,11 @@ vmm_attach(struct device *parent, struct device *self, void *aux)
 		sc->mode = VMM_MODE_UNKNOWN;
 	}
 
+	if (sc->mode == VMM_MODE_EPT && vmm_init_underjack() == 0) {
+		printf("/UJ");
+		vmm_do_underjack();
+	}
+
 	if (sc->mode == VMM_MODE_EPT || sc->mode == VMM_MODE_VMX) {
 		if (!(curcpu()->ci_vmm_cap.vcc_vmx.vmx_has_l1_flush_msr)) {
 			l1tf_flush_region = km_alloc(VMX_L1D_FLUSH_SIZE,
@@ -412,7 +432,6 @@ vmm_attach(struct device *parent, struct device *self, void *aux)
 			}
 		}
 	}
-	printf("\n");
 
 	if (sc->mode == VMM_MODE_SVM || sc->mode == VMM_MODE_RVI) {
 		sc->max_vpid = curcpu()->ci_vmm_cap.vcc_svm.svm_max_asid;
@@ -429,6 +448,8 @@ vmm_attach(struct device *parent, struct device *self, void *aux)
 	    "vcpupl", NULL);
 
 	vmm_softc = sc;
+
+	printf("\n");
 }
 
 /*
@@ -6701,6 +6722,16 @@ vmm_handle_cpuid(struct vcpu *vcpu)
 		return (0);
 	}
 
+	/* Underjacked host sees unmodified CPU values */
+	if (vmm_softc->vmm_uj) {
+		CPUID(*rax, eax, ebx, ecx, edx);
+		*rax = eax;
+		*rbx = ebx;
+		*rcx = ecx;
+		*rdx = edx;
+		return (0);
+	}
+
 	CPUID_LEAF(*rax, 0, eax, ebx, ecx, edx);
 
 	switch (*rax) {
@@ -7232,6 +7263,1045 @@ vmm_free_vpid(uint16_t vpid)
 	rw_exit_write(&vmm_softc->vpid_lock);
 }
 
+
+/*
+ * vmm_init_underjack
+ *
+ * Initializes the underjack - creates an EPT for the host and initializes a
+ * minimal host VMCS.
+ *
+ * Return values:
+ *  0: the underjack structures were created successfully and the host machine
+ *   supports underjack mode
+ *  ENOMEM: memory allocation failure for underjack structures
+ *  EOPNOTSUPP: the host does not support underjack mode
+ *  EINVAL: error allocating VM ID or VPID for the underjack host VM, or a
+ *   VMCS operation failed
+ */
+int
+vmm_init_underjack(void)
+{
+	uint16_t vpid;
+	struct pmap *pmap;
+	struct vcpu *vcpu;
+	struct vm *vm;
+	int i, ret;
+	uint32_t cr0, cr4;
+	uint32_t pinbased, procbased, procbased2, exit, entry;
+	uint32_t want1, want0;
+	uint64_t msr, ctrlval, eptp, cr3;
+	uint16_t ctrl;
+	struct cpu_info *ci;
+	struct region_descriptor gdt;
+	struct vmx_msr_store *msr_store;
+	paddr_t pa;
+
+	/* Assume no underjack */
+	vmm_softc->vmm_uj = 0;
+
+	vpid = 0;
+	pmap = NULL;
+	vcpu = NULL;
+	vm = NULL;
+	ret = 0;
+
+	/* Underjack is only supported with EPT */
+	if (vmm_softc->mode != VMM_MODE_EPT) {
+		DPRINTF("%s: cannot support underjack on non-EPT host\n",
+		    __func__);
+		return (EOPNOTSUPP);
+	}
+
+	/* Must be VPID 1 */
+	if (vmm_alloc_vpid(&vpid)) {
+		DPRINTF("%s: cannot allocate VPID for underjack\n", __func__);
+		return (ENOMEM);
+	}
+
+	if (vpid != 1) {
+		DPRINTF("%s: unexpected VPID %d returned for underjack\n",
+		    __func__, vpid);
+		ret = EINVAL;
+		goto exit;
+	}
+
+	DPRINTF("%s: allocated vpid %d\n", __func__, vpid);
+
+	pmap = pmap_create();
+	if (!pmap) {
+		DPRINTF("%s: error creating underjack page table\n",
+		    __func__);
+		ret = ENOMEM;
+		goto exit;
+	}
+
+	if (pmap_convert(pmap, PMAP_TYPE_EPT)) {
+		DPRINTF("%s: error converting underjack page table to EPT\n",
+		    __func__);
+		ret = EOPNOTSUPP;
+		goto exit;
+	}
+
+	DPRINTF("%s: underjack pmap @ %p\n", __func__, pmap);
+
+	vm = pool_get(&vm_pool, PR_NOWAIT | PR_ZERO);
+	if (vm == NULL) {
+		DPRINTF("%s: error allocating vm structure for underjack\n",
+		    __func__);
+		ret = ENOMEM;
+		goto exit;
+	}
+
+	DPRINTF("%s: underjack vm structure @ %p\n", __func__, vm);
+
+	SLIST_INIT(&vm->vm_vcpu_list);
+	rw_init(&vm->vm_vcpu_lock, "vcpulock");
+
+	vm->vm_creator_pid = 0;
+	vm->vm_nmemranges = 0;
+	vm->vm_memory_size = 0;
+	strncpy(vm->vm_name, "host", VMM_MAX_NAME_LEN);
+	rw_enter_write(&vmm_softc->vm_lock);
+	vmm_softc->vm_ct++;
+	vmm_softc->vm_idx++;
+
+	if (vmm_softc->vm_idx != 1) {
+		DPRINTF("%s: bad underjack VM id %zd\n", __func__,
+		    vmm_softc->vm_idx);
+		vmm_softc->vm_ct--;
+		vmm_softc->vm_idx--;
+		rw_exit_write(&vmm_softc->vm_lock);
+		pool_put(&vm_pool, vm);
+		ret = EINVAL;
+		goto exit;
+	}
+
+	vm->vm_id = vmm_softc->vm_idx;
+	vm->vm_vcpu_ct = 0;
+	vm->vm_vcpus_running = 0;
+
+	DPRINTF("%s: creating VCPUs\n", __func__);
+	start_vmm_on_cpu(curcpu());
+
+	for (i = 0; i < 1 /* XXX SMP */; i++) {
+		vcpu = pool_get(&vcpu_pool, PR_NOWAIT | PR_ZERO);
+		if (vcpu == NULL) {
+			DPRINTF("%s: failed to allocate vcpu %d for underjack "
+			    "vm\n", __func__, i);
+			vm_teardown(vm);
+			vmm_softc->vm_ct--;
+			vmm_softc->vm_idx--;
+			rw_exit_write(&vmm_softc->vm_lock);
+			ret = ENOMEM;
+			goto exit;
+		}
+
+		DPRINTF("%s: initializing VCPU %d\n", __func__, i);
+		if (vcpu_init(vcpu)) {
+			DPRINTF("%s: failed to init vcpu %d for underjack "
+			    "vm\n", __func__, i);
+			vm_teardown(vm);
+			vmm_softc->vm_ct--;
+			vmm_softc->vm_idx--;
+			rw_exit_write(&vmm_softc->vm_lock);
+			ret = ENOMEM;
+			goto exit;
+		}
+
+		rw_enter_write(&vm->vm_vcpu_lock);
+		vcpu->vc_id = vm->vm_vcpu_ct;
+		vm->vm_vcpu_ct++;
+		SLIST_INSERT_HEAD(&vm->vm_vcpu_list, vcpu, vc_vcpu_link);
+		rw_exit_write(&vm->vm_vcpu_lock);
+	}
+
+	SLIST_INSERT_HEAD(&vmm_softc->vm_list, vm, vm_link);
+	rw_exit_write(&vmm_softc->vm_lock);
+
+	ret = 0;
+
+	DPRINTF("%s: underjack VCPU VMCS @ 0x%llx\n", __func__,
+	    vcpu->vc_control_pa);
+	if (vcpu_reload_vmcs_vmx(&vcpu->vc_control_pa)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	/* Compute Basic Entry / Exit Controls */
+	vcpu->vc_vmx_basic = rdmsr(IA32_VMX_BASIC);
+	vcpu->vc_vmx_entry_ctls = rdmsr(IA32_VMX_ENTRY_CTLS);
+	vcpu->vc_vmx_exit_ctls = rdmsr(IA32_VMX_EXIT_CTLS);
+	vcpu->vc_vmx_pinbased_ctls = rdmsr(IA32_VMX_PINBASED_CTLS);
+	vcpu->vc_vmx_procbased_ctls = rdmsr(IA32_VMX_PROCBASED_CTLS);
+
+	/* Compute True Entry / Exit Controls (if applicable) */
+	if (vcpu->vc_vmx_basic & IA32_VMX_TRUE_CTLS_AVAIL) {
+		vcpu->vc_vmx_true_entry_ctls = rdmsr(IA32_VMX_TRUE_ENTRY_CTLS);
+		vcpu->vc_vmx_true_exit_ctls = rdmsr(IA32_VMX_TRUE_EXIT_CTLS);
+		vcpu->vc_vmx_true_pinbased_ctls =
+		    rdmsr(IA32_VMX_TRUE_PINBASED_CTLS);
+		vcpu->vc_vmx_true_procbased_ctls =
+		    rdmsr(IA32_VMX_TRUE_PROCBASED_CTLS);
+	}
+
+	/* Compute Secondary Procbased Controls (if applicable) */
+	if (vcpu_vmx_check_cap(vcpu, IA32_VMX_PROCBASED_CTLS,
+	    IA32_VMX_ACTIVATE_SECONDARY_CONTROLS, 1))
+		vcpu->vc_vmx_procbased2_ctls = rdmsr(IA32_VMX_PROCBASED2_CTLS);
+
+	/*
+	 * Pinbased ctrls
+	 *
+	 * None needed for underjack mode
+	 */
+	want1 = 0;
+	want0 = 0;
+
+	if (vcpu->vc_vmx_basic & IA32_VMX_TRUE_CTLS_AVAIL) {
+		ctrl = IA32_VMX_TRUE_PINBASED_CTLS;
+		ctrlval = vcpu->vc_vmx_true_pinbased_ctls;
+	} else {
+		ctrl = IA32_VMX_PINBASED_CTLS;
+		ctrlval = vcpu->vc_vmx_pinbased_ctls;
+	}
+
+	if (vcpu_vmx_compute_ctrl(ctrlval, ctrl, want1, want0, &pinbased)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	DPRINTF("%s: selected pinbased controls 0x%x\n", __func__, pinbased);
+	if (vmwrite(VMCS_PINBASED_CTLS, pinbased)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	/*
+	 * Procbased ctrls
+	 *
+	 * Underjack mode requires EPT and no CR3 exiting
+	 */
+	want1 = IA32_VMX_ACTIVATE_SECONDARY_CONTROLS | IA32_VMX_USE_MSR_BITMAPS;
+	want0 = IA32_VMX_CR3_LOAD_EXITING | IA32_VMX_CR3_STORE_EXITING;
+
+	if (vcpu->vc_vmx_basic & IA32_VMX_TRUE_CTLS_AVAIL) {
+		ctrl = IA32_VMX_TRUE_PROCBASED_CTLS;
+		ctrlval = vcpu->vc_vmx_true_procbased_ctls;
+	} else {
+		ctrl = IA32_VMX_PROCBASED_CTLS;
+		ctrlval = vcpu->vc_vmx_procbased_ctls;
+	}
+
+	if (vcpu_vmx_compute_ctrl(ctrlval, ctrl, want1, want0, &procbased)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	DPRINTF("%s: selected procbased controls 0x%x\n", __func__, procbased);
+	if (vmwrite(VMCS_PROCBASED_CTLS, procbased)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	/*
+	 * Secondary Procbased ctrls
+	 *
+	 * Underjack mode requires:
+	 *
+	 * IA32_VMX_ENABLE_VPID - use VPID
+	 * IA32_VMX_ENABLE_EPT - enable EPT
+	 */
+	want1 = IA32_VMX_ENABLE_VPID | IA32_VMX_ENABLE_EPT;
+
+	want0 = ~want1;
+	ctrlval = vcpu->vc_vmx_procbased2_ctls;
+	ctrl = IA32_VMX_PROCBASED2_CTLS;
+
+	if (vcpu_vmx_compute_ctrl(ctrlval, ctrl, want1, want0, &procbased2)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	DPRINTF("%s: selected secondary procbased controls 0x%x\n", __func__, procbased2);
+	if (vmwrite(VMCS_PROCBASED2_CTLS, procbased2)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	/*
+	 * Exit ctrls
+	 *
+	 * We must be able to set the following:
+	 * IA32_VMX_HOST_SPACE_ADDRESS_SIZE - exit to long mode
+	 */
+	want1 = IA32_VMX_HOST_SPACE_ADDRESS_SIZE;
+	want0 = 0;
+
+	if (vcpu->vc_vmx_basic & IA32_VMX_TRUE_CTLS_AVAIL) {
+		ctrl = IA32_VMX_TRUE_EXIT_CTLS;
+		ctrlval = vcpu->vc_vmx_true_exit_ctls;
+	} else {
+		ctrl = IA32_VMX_EXIT_CTLS;
+		ctrlval = vcpu->vc_vmx_exit_ctls;
+	}
+
+	if (vcpu_vmx_compute_ctrl(ctrlval, ctrl, want1, want0, &exit)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	DPRINTF("%s: selected exit controls 0x%x\n", __func__, exit);
+	if (vmwrite(VMCS_EXIT_CTLS, exit)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	/*
+	 * Entry ctrls
+	 *
+	 * We must be able to set the following:
+	 * IA32_VMX_IA32E_MODE_GUEST
+	 */
+	want1 = IA32_VMX_IA32E_MODE_GUEST;
+
+	if (vcpu->vc_vmx_basic & IA32_VMX_TRUE_CTLS_AVAIL) {
+		ctrl = IA32_VMX_TRUE_ENTRY_CTLS;
+		ctrlval = vcpu->vc_vmx_true_entry_ctls;
+	} else {
+		ctrl = IA32_VMX_ENTRY_CTLS;
+		ctrlval = vcpu->vc_vmx_entry_ctls;
+	}
+
+	if (vcpu_vmx_compute_ctrl(ctrlval, ctrl, want1, want0, &entry)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	DPRINTF("%s: selected entry controls 0x%x\n", __func__, entry);
+	if (vmwrite(VMCS_ENTRY_CTLS, entry)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	eptp = pmap->pm_pdirpa;
+	msr = rdmsr(IA32_VMX_EPT_VPID_CAP);
+	if (msr & IA32_EPT_VPID_CAP_PAGE_WALK_4) {
+		/* Page walk length 4 supported */
+		eptp |= ((IA32_EPT_PAGE_WALK_LENGTH - 1) << 3);
+	} else {
+		DPRINTF("%s: EPT page walk length 4 not supported", __func__);
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (msr & IA32_EPT_VPID_CAP_WB) {
+		/* WB cache type supported */
+		eptp |= IA32_EPT_PAGING_CACHE_TYPE_WB;
+	}
+
+	DPRINTF("underjack eptp = 0x%llx\n", eptp);
+	if (vmwrite(VMCS_GUEST_IA32_EPTP, eptp)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_VPID, vpid)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	vcpu->vc_vpid = vpid;
+
+	/*
+	 * Determine which bits in CR0 have to be set to a fixed
+	 * value as per Intel SDM A.7.
+	 * CR0 bits in the vrs parameter must match these.
+	 */
+
+	want1 = (curcpu()->ci_vmm_cap.vcc_vmx.vmx_cr0_fixed0) &
+	    (curcpu()->ci_vmm_cap.vcc_vmx.vmx_cr0_fixed1);
+	want0 = ~(curcpu()->ci_vmm_cap.vcc_vmx.vmx_cr0_fixed0) &
+	    ~(curcpu()->ci_vmm_cap.vcc_vmx.vmx_cr0_fixed1);
+
+	cr0 = rcr0();
+
+	if (want1 & CR0_NE)
+		cr0 |= CR0_NE;
+
+	if ((cr0 & want1) != want1) {
+		ret = EINVAL;
+		goto exit;
+	}
+	if ((~cr0 & want0) != want0) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	cr3 = rcr3();
+
+	cr4 = rcr4() | CR4_VMXE;
+
+	DPRINTF("underjack cr0 = 0x%x\n", cr0);
+	if (vmwrite(VMCS_GUEST_IA32_CR0, cr0)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_HOST_IA32_CR0, cr0)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	DPRINTF("underjack cr3 = 0x%llx\n", cr3);
+	if (vmwrite(VMCS_HOST_IA32_CR3, cr3)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_CR3, cr3)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	DPRINTF("underjack cr4 = 0x%x\n", cr4);
+	if (vmwrite(VMCS_GUEST_IA32_CR4, cr4)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_HOST_IA32_CR4, cr4)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_CS_SEL, 0x8)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_CS_LIMIT, 0xFFFFFFFF)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_CS_AR, 0xA09B)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_CS_BASE, 0)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_DS_SEL, 0x10)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_DS_LIMIT, 0xFFFFFFFF)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_DS_AR, 0xC093)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_DS_BASE, 0)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_ES_SEL, 0x10)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_ES_LIMIT, 0xFFFFFFFF)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_ES_AR, 0xC093)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_ES_BASE, 0)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_FS_SEL, 0x10)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_FS_LIMIT, 0xFFFFFFFF)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_FS_AR, 0xC093)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_FS_BASE, rdmsr(MSR_FSBASE))) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_GS_SEL, 0x10)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_GS_LIMIT, 0xFFFFFFFF)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_GS_AR, 0xC093)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_GS_BASE, rdmsr(MSR_GSBASE))) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_SS_SEL, 0x10)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_SS_LIMIT, 0xFFFFFFFF)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_SS_AR, 0xC093)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_SS_BASE, 0)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_LDTR_SEL, 0x0)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_LDTR_LIMIT, 0xFFFF)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_LDTR_AR, 0x0082)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_LDTR_BASE, 0)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_TR_SEL, 0x30)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_LDTR_LIMIT, 0xFFFF)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_TR_AR, 0x008B)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+#if 0
+	if (vmwrite(VMCS_GUEST_IA32_TR_BASE, 0)) {
+		ret = EINVAL;
+		goto exit;
+	}
+#endif
+
+	ci = curcpu();
+	setregion(&gdt, ci->ci_gdt, GDT_SIZE - 1);
+
+	/* Host GDTR base */
+	if (vmwrite(VMCS_HOST_IA32_GDTR_BASE, gdt.rd_base)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+#if 0 // XXX undefined?
+	/* Host GDTR limit */
+	if (vmwrite(VMCS_HOST_IA32_GDTR_LIMIT, 0x3F)) {
+		ret = EINVAL;
+		goto exit;
+	}
+#endif
+
+	/* Host TR base */
+	if (vmwrite(VMCS_HOST_IA32_TR_BASE,
+	    (uint64_t)curcpu()->ci_tss)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	/* Guest GDTR base */
+	if (vmwrite(VMCS_GUEST_IA32_GDTR_BASE, gdt.rd_base)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	/* Guest GDTR limit */
+	if (vmwrite(VMCS_GUEST_IA32_GDTR_LIMIT, 0x3F)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	/* Guest TR base */
+	if (vmwrite(VMCS_GUEST_IA32_TR_BASE,
+	    (uint64_t)curcpu()->ci_tss)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	/* Guest TR limit */
+	if (vmwrite(VMCS_GUEST_IA32_TR_LIMIT, 0xFFFF)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	/* Host IDTR base */
+	if (vmwrite(VMCS_HOST_IA32_IDTR_BASE, idt_vaddr)) {
+		DPRINTF("%s: error writing host IDTR base\n", __func__);
+		ret = EINVAL;
+		goto exit;
+	}
+
+#if 0 // XXX undefined?
+	/* Host IDTR limit */
+	if (vmwrite(VMCS_HOST_IA32_IDTR_LIMIT, 0xFFF)) {
+		DPRINTF("%s: error writing host IDTR limit\n", __func__);
+		ret = EINVAL;
+		goto exit;
+	}
+#endif
+
+	/* Guest IDTR base */
+	if (vmwrite(VMCS_GUEST_IA32_IDTR_BASE, idt_vaddr)) {
+		DPRINTF("%s: error writing guest IDTR base\n", __func__);
+		ret = EINVAL;
+		goto exit;
+	}
+
+	/* Guest IDTR limit */
+	if (vmwrite(VMCS_GUEST_IA32_IDTR_LIMIT, 0xFFF)) {
+		DPRINTF("%s: error writing guest IDTR limit\n", __func__);
+		ret = EINVAL;
+		goto exit;
+	}
+
+	/* Allocate MSR bitmap VA */
+	vcpu->vc_msr_bitmap_va = (vaddr_t)km_alloc(PAGE_SIZE, &kv_page, &kp_zero,
+	    &kd_waitok);
+
+	if (!vcpu->vc_msr_bitmap_va) {
+		ret = ENOMEM;
+		goto exit;
+	}
+
+	/* Compute MSR bitmap PA */
+	if (!pmap_extract(pmap_kernel(), vcpu->vc_msr_bitmap_va,
+	    (paddr_t *)&vcpu->vc_msr_bitmap_pa)) {
+		ret = ENOMEM;
+		goto exit;
+	}
+
+	/* Allocate MSR exit load area VA */
+	vcpu->vc_vmx_msr_exit_load_va = (vaddr_t)km_alloc(PAGE_SIZE, &kv_page,
+	   &kp_zero, &kd_waitok);
+
+	if (!vcpu->vc_vmx_msr_exit_load_va) {
+		ret = ENOMEM;
+		goto exit;
+	}
+
+	/* Compute MSR exit load area PA */
+	if (!pmap_extract(pmap_kernel(), vcpu->vc_vmx_msr_exit_load_va,
+	    &vcpu->vc_vmx_msr_exit_load_pa)) {
+		ret = ENOMEM;
+		goto exit;
+	}
+
+	/* Allocate MSR exit save area VA */
+	vcpu->vc_vmx_msr_exit_save_va = (vaddr_t)km_alloc(PAGE_SIZE, &kv_page,
+	   &kp_zero, &kd_waitok);
+
+	if (!vcpu->vc_vmx_msr_exit_save_va) {
+		ret = ENOMEM;
+		goto exit;
+	}
+
+	/* Compute MSR exit save area PA */
+	if (!pmap_extract(pmap_kernel(), vcpu->vc_vmx_msr_exit_save_va,
+	    &vcpu->vc_vmx_msr_exit_save_pa)) {
+		ret = ENOMEM;
+		goto exit;
+	}
+
+	/* Allocate MSR entry load area VA */
+	vcpu->vc_vmx_msr_entry_load_va = (vaddr_t)km_alloc(PAGE_SIZE, &kv_page,
+	   &kp_zero, &kd_waitok);
+
+	if (!vcpu->vc_vmx_msr_entry_load_va) {
+		ret = ENOMEM;
+		goto exit;
+	}
+
+	/* Compute MSR entry load area PA */
+	if (!pmap_extract(pmap_kernel(), vcpu->vc_vmx_msr_entry_load_va,
+	    &vcpu->vc_vmx_msr_entry_load_pa)) {
+		ret = ENOMEM;
+		goto exit;
+	}
+
+	/*
+	 * Select host MSRs to be loaded on exit
+	 */
+	msr_store = (struct vmx_msr_store *)vcpu->vc_vmx_msr_exit_load_va;
+	msr_store[0].vms_index = MSR_EFER;
+	msr_store[0].vms_data = rdmsr(MSR_EFER);
+	msr_store[1].vms_index = MSR_STAR;
+	msr_store[1].vms_data = rdmsr(MSR_STAR);
+	msr_store[2].vms_index = MSR_LSTAR;
+	msr_store[2].vms_data = rdmsr(MSR_LSTAR);
+	msr_store[3].vms_index = MSR_CSTAR;
+	msr_store[3].vms_data = rdmsr(MSR_CSTAR);
+	msr_store[4].vms_index = MSR_SFMASK;
+	msr_store[4].vms_data = rdmsr(MSR_SFMASK);
+	msr_store[5].vms_index = MSR_KERNELGSBASE;
+	msr_store[5].vms_data = rdmsr(MSR_KERNELGSBASE);
+	msr_store[6].vms_index = MSR_MISC_ENABLE;
+	msr_store[6].vms_data = rdmsr(MSR_MISC_ENABLE);
+
+	/*
+	 * Select guest MSRs to be loaded on entry / saved on exit
+	 */
+	msr_store = (struct vmx_msr_store *)vcpu->vc_vmx_msr_exit_save_va;
+
+	msr_store[0].vms_index = MSR_EFER;
+	msr_store[0].vms_data = rdmsr(MSR_EFER);
+	msr_store[1].vms_index = MSR_STAR;
+	msr_store[1].vms_data = rdmsr(MSR_STAR);
+	msr_store[2].vms_index = MSR_LSTAR;
+	msr_store[2].vms_data = rdmsr(MSR_LSTAR);
+	msr_store[3].vms_index = MSR_CSTAR;
+	msr_store[3].vms_data = rdmsr(MSR_CSTAR);
+	msr_store[4].vms_index = MSR_SFMASK;
+	msr_store[4].vms_data = rdmsr(MSR_SFMASK);
+	msr_store[5].vms_index = MSR_KERNELGSBASE;
+	msr_store[5].vms_data = rdmsr(MSR_KERNELGSBASE);
+	msr_store[6].vms_index = MSR_MISC_ENABLE;
+	msr_store[6].vms_data = rdmsr(MSR_MISC_ENABLE);
+
+	/*
+	 * Currently we have the same count of entry/exit MSRs loads/stores
+	 * but this is not an architectural requirement.
+	 */
+	if (vmwrite(VMCS_EXIT_MSR_STORE_COUNT, VMX_NUM_MSR_STORE)) {
+		DPRINTF("%s: error setting guest MSR exit store count\n",
+		    __func__);
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_EXIT_MSR_LOAD_COUNT, VMX_NUM_MSR_STORE)) {
+		DPRINTF("%s: error setting guest MSR exit load count\n",
+		    __func__);
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_ENTRY_MSR_LOAD_COUNT, VMX_NUM_MSR_STORE)) {
+		DPRINTF("%s: error setting guest MSR entry load count\n",
+		    __func__);
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_EXIT_STORE_MSR_ADDRESS,
+	    vcpu->vc_vmx_msr_exit_save_pa)) {
+		DPRINTF("%s: error setting guest MSR exit store address\n",
+		    __func__);
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_EXIT_LOAD_MSR_ADDRESS,
+	    vcpu->vc_vmx_msr_exit_load_pa)) {
+		DPRINTF("%s: error setting guest MSR exit load address\n",
+		    __func__);
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_ENTRY_LOAD_MSR_ADDRESS,
+	    vcpu->vc_vmx_msr_exit_save_pa)) {
+		DPRINTF("%s: error setting guest MSR entry load address\n",
+		    __func__);
+		ret = EINVAL;
+		goto exit;
+	}
+
+	if (vmwrite(VMCS_MSR_BITMAP_ADDRESS,
+	    vcpu->vc_msr_bitmap_pa)) {
+		DPRINTF("%s: error setting guest MSR bitmap address\n",
+		    __func__);
+		ret = EINVAL;
+		goto exit;
+	}
+
+	// host gsbase
+	// host kgsbase
+	// host fsbase
+	// guest gsbase
+	// guest kgsbase
+	// guest fsbase
+	// guest rip
+	// guest rsp
+	// host idt
+	// guest idt
+	// host gdt
+	// guest gdt
+
+	/* Flush the VMCS */
+	if (vmclear(&vcpu->vc_control_pa)) {
+		ret = EINVAL;
+		goto exit;
+	}
+
+	for (i = 0; i < mem_cluster_cnt; i++) {
+		pa = mem_clusters[i].start;
+		while (pa < mem_clusters[i].start + mem_clusters[i].size) {
+//			DPRINTF("%s: mapping 0x%llx\n", __func__, (uint64_t)pa);
+			if (pmap_enter(pmap, (vaddr_t)pa,
+			    (vaddr_t)pa, PROT_READ | PROT_WRITE | PROT_EXEC,
+			    PMAP_WIRED))
+				panic("%s: cannot create new EPT mapping for underjack",
+				    __func__);
+			pa += PAGE_SIZE;
+		}
+//		db_enter();
+	}
+
+	pmap_enter(pmap, (vaddr_t)0xfee00000, (vaddr_t)0xfee00000, PROT_READ | PROT_WRITE, PMAP_WIRED);
+	pmap_enter(pmap, (vaddr_t)0xfec00000, (vaddr_t)0xfec00000, PROT_READ | PROT_WRITE, PMAP_WIRED);
+	for (pa = (paddr_t)0xb8000; pa < (paddr_t)0xc0000; pa += PAGE_SIZE)
+		pmap_enter(pmap, (vaddr_t)pa, (vaddr_t)pa, PROT_READ | PROT_WRITE, PMAP_WIRED);
+
+exit:
+
+	if (ret == 0) {
+		vmm_softc->vmm_uj = 1;
+		vmm_softc->vmm_uj_pmap = *pmap;
+		vmm_softc->vmm_uj_vcpu = *vcpu;
+//		db_enter();
+	} else {
+		if (pmap != NULL)
+			pmap_destroy(pmap);
+		if (vpid != 0)
+			vmm_free_vpid(vpid);
+	}
+
+	return (ret);
+}
+
+/*
+ * vmm_do_underjack
+ *
+ * Enters underjack mode, if available and configured on this host.
+ * This function forms the main loop of the underjack hypervisor and will
+ * never exit.
+ */
+void
+vmm_do_underjack(void)
+{
+	vaddr_t uj_stack;
+
+	if (!vmm_softc->vmm_uj)
+		return;
+
+	uj_stack = (vaddr_t)km_alloc(PAGE_SIZE, &kv_page, &kp_zero,
+	    &kd_waitok);
+
+	DPRINTF("%s: underjack stack page @ 0x%llx\n", __func__,
+	    (uint64_t)uj_stack);
+
+	DPRINTF("%s: starting underjack\n", DEVNAME(vmm_softc));
+
+	/* startup VMM mode */
+	if (vmm_start()) {
+		DPRINTF("%s: error starting vmm mode\n", __func__);
+		return;
+	}
+
+	if (vmptrld(&vmm_softc->vmm_uj_vcpu.vc_control_pa)) {
+		DPRINTF("%s: error loading vmcs ptr\n", __func__);
+		db_enter();
+	}
+
+	vmx_underjack_set_regs(&vmm_softc->vmm_uj_vcpu.vc_gueststate);
+
+	vmx_underjack_toggle_stack(uj_stack);
+
+	while (1) {
+		vmx_enter_underjack(0, &vmm_softc->vmm_uj_vcpu.vc_gueststate);
+		vmx_handle_underjack_exit();
+
+		if (vcpu_reload_vmcs_vmx(
+		    &vmm_softc->vmm_uj_vcpu.vc_control_pa)) {
+			DPRINTF("%s: error reloading vmcs ptr\n", __func__);
+			db_enter();
+		}
+	}
+}
+
+/*
+ * vmx_handle_underjack_exit
+ *
+ * Handle exits from the host by decoding the exit reason and calling various
+ * subhandlers as needed.
+ */
+int
+vmx_handle_underjack_exit(void)
+{
+	uint64_t exit_reason, rflags, istate;
+	int update_rip, ret = 0, exitinfo;
+	struct vcpu *vcpu = &vmm_softc->vmm_uj_vcpu;
+
+	exitinfo = vmx_get_exit_info(
+	    &vcpu->vc_gueststate.vg_rip, &exit_reason);
+
+	if (vmread(VMCS_GUEST_IA32_RFLAGS,
+	    &vcpu->vc_gueststate.vg_rflags)) {
+		printf("%s: can't read guest rflags during "
+		    "exit\n", __func__);
+		return (EINVAL);
+	}
+
+	update_rip = 0;
+	rflags = vcpu->vc_gueststate.vg_rflags;
+
+	switch (exit_reason) {
+	case VMX_EXIT_EPT_VIOLATION:
+		ret = vmx_handle_np_uj_fault(vcpu);
+		break;
+	case VMX_EXIT_CPUID:
+		ret = vmm_handle_cpuid(vcpu);
+		update_rip = 1;
+		break;
+	case VMX_EXIT_TRIPLE_FAULT:
+#ifdef VMM_DEBUG
+		DPRINTF("%s: underjack vcpu %d triple fault\n", __func__,
+		    vcpu->vc_id);
+		vmx_vcpu_dump_regs(vcpu);
+		dump_vcpu(vcpu);
+		vmx_dump_vmcs(vcpu);
+#endif /* VMM_DEBUG */
+		panic("host triple fault @ %%rip = 0x%llx",
+		    vcpu->vc_gueststate.vg_rip);
+		break;
+	default:
+		DPRINTF("%s: unhandled underjack exit %lld (%s)\n", __func__,
+		    exit_reason, vmx_exit_reason_decode(exit_reason));
+		db_enter();
+		return (EINVAL);
+	}
+
+	if (update_rip) {
+		if (vmwrite(VMCS_GUEST_IA32_RIP,
+		    vcpu->vc_gueststate.vg_rip)) {
+			printf("%s: can't advance rip\n", __func__);
+			return (EINVAL);
+		}
+
+		if (vmread(VMCS_GUEST_INTERRUPTIBILITY_ST,
+		    &istate)) {
+			printf("%s: can't read interruptibility state\n",
+			    __func__);
+			return (EINVAL);
+		}
+
+		/* Interruptibilty state 0x3 covers NMIs and STI */
+		istate &= ~0x3;
+
+		if (vmwrite(VMCS_GUEST_INTERRUPTIBILITY_ST,
+		    istate)) {
+			printf("%s: can't write interruptibility state\n",
+			    __func__);
+			return (EINVAL);
+		}
+
+		if (rflags & PSL_T) {
+			if (vmm_inject_db(vcpu)) {
+				printf("%s: can't inject #DB exception to "
+				    "guest", __func__);
+				return (EINVAL);
+			}
+		}
+	}
+
+	return (ret);
+}
+
+/*
+ * vmx_handle_np_uj_fault
+ *
+ * EPT violation handler for the underjacked host. Since we allow the host
+ * to access all phys mem, this means we should just put an entry directly
+ * into the EPT.
+ *
+ * Parameters:
+ *  vcpu: underjack vcpu that caused this fault
+ *
+ * Return values:
+ *  Always 0 (always succeeds, or panics the machine)
+ */
+int
+vmx_handle_np_uj_fault(struct vcpu *vcpu)
+{
+	uint64_t gpa;
+
+	if (vmread(VMCS_GUEST_PHYSICAL_ADDRESS, &gpa)) {
+		panic("%s: cannot extract faulting pa\n", __func__);
+	}
+
+	gpa &= ~PAGE_MASK;
+//	DPRINTF("%s: entering identity mapping for page 0x%llx, guest rip=0x%llx\n", __func__,
+//	    gpa, vcpu->vc_gueststate.vg_rip);
+//	db_enter();
+
+	if (pmap_enter(&vmm_softc->vmm_uj_pmap, (vaddr_t)gpa, (vaddr_t)gpa,
+	    PROT_READ | PROT_WRITE | PROT_EXEC, PMAP_WIRED))
+		panic("%s: cannot create new EPT mapping for underjack",
+		    __func__);
+
+	return (0);
+}
 
 /* vmm_gpa_is_valid
  *
