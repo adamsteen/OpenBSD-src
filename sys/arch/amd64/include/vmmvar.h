@@ -111,6 +111,15 @@
 #define VM_EXIT_NONE				0xFFFF
 
 /*
+ * VMX: Nested virtualization - SDM Vol3 Appendix A
+ */
+#define VMX_NESTED_VMCS_REVID			0x00000B5D
+#define VMX_NESTED_REGION_SIZE			PAGE_SIZE
+#define VMX_NESTED_VMCS_CACHE_MODE		0x6
+#define VMX_MISC_TSC_PREEMPTION_RATE		0x0
+#define VMX_MISC_ACTIVITY_STATE			0x1
+
+/*
  * SVM: Intercept codes (exit reasons)
  */
 #define SVM_VMEXIT_CR0_READ			0x00
@@ -621,7 +630,7 @@ struct vm_mprotect_ept_params {
  *  Speculative execution control features (AMD)
  */
 #define VMM_CPUIDECX_MASK ~(CPUIDECX_EST | CPUIDECX_TM2 | CPUIDECX_MWAIT | \
-    CPUIDECX_PDCM | CPUIDECX_VMX | CPUIDECX_DTES64 | \
+    CPUIDECX_PDCM | CPUIDECX_DTES64 | \
     CPUIDECX_DSCPL | CPUIDECX_SMX | CPUIDECX_CNXTID | \
     CPUIDECX_SDBG | CPUIDECX_XTPR | CPUIDECX_PCID | \
     CPUIDECX_DCA | CPUIDECX_X2APIC | CPUIDECX_DEADLINE)
@@ -696,12 +705,27 @@ struct vm_mprotect_ept_params {
 #define SVM_MSRBIT_R(m) (1 << (((m) % 4) * 2))
 #define SVM_MSRBIT_W(m) (1 << (((m) % 4) * 2 + 1))
 
+/*
+ * vmm(4) mode of operation.
+ */
 enum {
 	VMM_MODE_UNKNOWN,
 	VMM_MODE_VMX,
 	VMM_MODE_EPT,
 	VMM_MODE_SVM,
-	VMM_MODE_RVI
+	VMM_MODE_RVI,
+};
+
+/*
+ * Nesting translations -
+ *
+ * NONE -> guest VMXON -> ROOT -> guest VMLAUNCH/VMRESUME -> NONROOT ->
+ *  guest VMEXIT -> ROOT -> guest VMXOFF -> NONE
+ */
+enum {
+	VMX_NESTING_MODE_NONE,
+	VMX_NESTING_MODE_ROOT,
+	VMX_NESTING_MODE_NONROOT,
 };
 
 enum {
@@ -821,8 +845,204 @@ struct vmcb {
 	};
 };
 
+struct vmcs_split_field {
+	union {
+		struct {
+			uint32_t lo;
+			uint32_t hi;
+		};
+		uint64_t full;
+	};
+};
+
 struct vmcs {
+	/* Revision ID */
 	uint32_t	vmcs_revision;
+
+	/* 16-bit control fields */
+	uint16_t	vpid;					/* 00000000h */
+	uint16_t	pi_notification_vector;			/* 00000002h */
+	uint16_t	eptp_index;				/* 00000004h */
+
+	/* 16-bit guest state fields */
+	uint16_t	guest_es_sel;				/* 00000800h */
+	uint16_t	guest_cs_sel;				/* 00000802h */
+	uint16_t	guest_ss_sel;				/* 00000804h */
+	uint16_t	guest_ds_sel;				/* 00000806h */
+	uint16_t	guest_fs_sel;				/* 00000808h */
+	uint16_t	guest_gs_sel;				/* 0000080Ah */
+	uint16_t	guest_ldtr_sel;				/* 0000080Ch */
+	uint16_t	guest_tr_sel;				/* 0000080Eh */
+	uint16_t	guest_intr_status;			/* 00000810h */
+	uint16_t	pml_index;				/* 00000812h */
+
+	/* 16-bit host state fields */
+	uint16_t	host_es_sel;				/* 00000C00h */
+	uint16_t	host_cs_sel;				/* 00000C02h */
+	uint16_t	host_ss_sel;				/* 00000C04h */
+	uint16_t	host_ds_sel;				/* 00000C06h */
+	uint16_t	host_fs_sel;				/* 00000C08h */
+	uint16_t	host_gs_sel;				/* 00000C0Ah */
+	uint16_t	host_tr_sel;				/* 00000C0Ch */
+
+	/* 64-bit control fields */
+	struct vmcs_split_field io_bitmap_a;			/* 00002000h */
+	struct vmcs_split_field io_bitmap_b;			/* 00002002h */
+	struct vmcs_split_field msr_bitmap_addr;		/* 00002004h */
+	struct vmcs_split_field exit_msr_store_addr;		/* 00002006h */
+	struct vmcs_split_field exit_msr_load_addr;		/* 00002008h */
+	struct vmcs_split_field entry_msr_load_addr;		/* 0000200Ah */
+	struct vmcs_split_field executive_vmcs_pointer;		/* 0000200Ch */
+	struct vmcs_split_field pml_address;			/* 0000200Eh */
+	struct vmcs_split_field tsc_offset;			/* 00002010h */
+	struct vmcs_split_field virtual_apic_address;		/* 00002012h */
+	struct vmcs_split_field apic_accees_address;		/* 00002014h */
+	struct vmcs_split_field posted_int_desc_address;	/* 00002016h */
+	struct vmcs_split_field vm_function_controls;		/* 00002018h */
+	struct vmcs_split_field eptp;				/* 0000201Ah */
+	struct vmcs_split_field eoi_exit_bitmap_0;		/* 0000201Ch */
+	struct vmcs_split_field eoi_exit_bitmap_1;		/* 0000201Eh */
+	struct vmcs_split_field eoi_exit_bitmap_2;		/* 00002020h */
+	struct vmcs_split_field eoi_exit_bitmap_3;		/* 00002022h */
+	struct vmcs_split_field eptp_list_address;		/* 00002024h */
+	struct vmcs_split_field vmread_bitmap_address;		/* 00002026h */
+	struct vmcs_split_field vmwrite_bitmap_address;		/* 00002028h */
+	struct vmcs_split_field virt_execption_info_address;	/* 0000202Ah */
+	struct vmcs_split_field xss_exiting_bitmap;		/* 0000202Ch */
+	struct vmcs_split_field encls_exiting_bitmap;		/* 0000202Eh */
+	struct vmcs_split_field tsc_multiplier;			/* 00002032h */
+
+	/* 64-bit read only data field */
+	struct vmcs_split_field	guest_physical_address;		/* 00002400h */
+
+	/* 64-bit guest state fields */
+	struct vmcs_split_field vmcs_link_pointer;		/* 00002800h */
+	struct vmcs_split_field guest_debugctl;			/* 00002802h */
+	struct vmcs_split_field guest_pat;			/* 00002804h */
+	struct vmcs_split_field guest_efer;			/* 00002806h */
+	struct vmcs_split_field guest_perf_global_ctrl;		/* 00002808h */
+	struct vmcs_split_field guest_pdpte0;			/* 0000280Ah */
+	struct vmcs_split_field guest_pdpte1;			/* 0000280Ch */
+	struct vmcs_split_field guest_pdpte2;			/* 0000280Eh */
+	struct vmcs_split_field guest_pdpte3;			/* 00002810h */
+	struct vmcs_split_field guest_bndcfgs;			/* 00002812h */
+
+	/* 64-bit host state fields */
+	struct vmcs_split_field host_pat;			/* 00002C00h */
+	struct vmcs_split_field host_efer;			/* 00002C02h */
+	struct vmcs_split_field host_perf_global_ctrl;		/* 00002C04h */
+
+	/* 32-bit control fields */
+	uint32_t	pinbased_ctrls;				/* 00004000h */
+	uint32_t	procbased_ctrls;			/* 00004002h */
+	uint32_t	exception_bitmap;			/* 00004004h */
+	uint32_t	pf_error_code_mask;			/* 00004006h */
+	uint32_t	pf_error_code_match;			/* 00004008h */
+	uint32_t	cr3_target_count;			/* 0000400Ah */
+	uint32_t	exit_ctrls;				/* 0000400Ch */
+	uint32_t	exit_msr_store_count;			/* 0000400Eh */
+	uint32_t	exit_msr_load_count;			/* 00004010h */
+	uint32_t	entry_ctrls;				/* 00004012h */
+	uint32_t	entry_msr_load_count;			/* 00004014h */
+	uint32_t	entry_interruption_info;		/* 00004016h */
+	uint32_t	entry_exception_error_code;		/* 00004018h */
+	uint32_t	entry_instruction_length;		/* 0000401Ah */
+	uint32_t	tpr_threshold;				/* 0000401Ch */
+	uint32_t	secondary_procbased_ctrls;		/* 0000401Eh */
+	uint32_t	ple_gap;				/* 00004020h */
+	uint32_t	ple_window;				/* 00004022h */
+
+	/* 32-bit read only data fields */
+	uint32_t	instruction_error;			/* 00004400h */
+	uint32_t	exit_reason;				/* 00004402h */
+	uint32_t	exit_interruption_info;			/* 00004404h */
+	uint32_t	exit_interruption_error_code;		/* 00004406h */
+	uint32_t	idt_vectoring_info;			/* 00004408h */
+	uint32_t	idt_vectoring_error_code;		/* 0000440Ah */
+	uint32_t	exit_instruction_length;		/* 0000440Ch */
+	uint32_t	exit_instruction_information;		/* 0000440Eh */
+
+	/* 32-bit guest state fields */
+	uint32_t	guest_es_limit;				/* 00004800h */
+	uint32_t	guest_cs_limit;				/* 00004802h */
+	uint32_t	guest_ss_limit;				/* 00004804h */
+	uint32_t	guest_ds_limit;				/* 00004806h */
+	uint32_t	guest_fs_limit;				/* 00004808h */
+	uint32_t	guest_gs_limit;				/* 0000480Ah */
+	uint32_t	guest_ldtr_limit;			/* 0000480Ch */
+	uint32_t	guest_tr_limit;				/* 0000480Eh */
+	uint32_t	guest_gdtr_limit;			/* 00004810h */
+	uint32_t	guest_idtr_limit;			/* 00004812h */
+	uint32_t	guest_es_ar;				/* 00004814h */
+	uint32_t	guest_cs_ar;				/* 00004816h */
+	uint32_t	guest_ss_ar;				/* 00004818h */
+	uint32_t	guest_ds_ar;				/* 0000481Ah */
+	uint32_t	guest_fs_ar;				/* 0000481Ch */
+	uint32_t	guest_gs_ar;				/* 0000481Eh */
+	uint32_t	guest_ldtr_ar;				/* 00004820h */
+	uint32_t	guest_tr_ar;				/* 00004822h */
+	uint32_t	guest_interruptibility_state;		/* 00004824h */
+	uint32_t	guest_activity_state;			/* 00004826h */
+	uint32_t	guest_smbase;				/* 00004828h */
+	uint32_t	guest_sysenter_cs;			/* 0000482Ah */
+	uint32_t	vmx_preemption_timer_val;		/* 0000482Eh */
+
+	/* 32-bit host state field */
+	uint32_t	host_sysenter_cs;			/* 00004C00h */
+
+	/* Natural width control fields */
+	uint64_t	cr0_mask;				/* 00006000h */
+	uint64_t	cr4_mask;				/* 00006002h */
+	uint64_t	cr0_read_shadow;			/* 00006004h */
+	uint64_t	cr4_read_shadow;			/* 00006006h */
+	uint64_t	cr3_target_0;				/* 00006008h */
+	uint64_t	cr3_target_1;				/* 0000600Ah */
+	uint64_t	cr3_target_2;				/* 0000600Ch */
+	uint64_t	cr3_target_3;				/* 0000600Eh */
+
+	/* Natural width read only data fields */
+	uint64_t	exit_qualification;			/* 00006400h */
+	uint64_t	io_rcx;					/* 00006402h */
+	uint64_t	io_rsi;					/* 00006404h */
+	uint64_t	io_rdi;					/* 00006406h */
+	uint64_t	io_rip;					/* 00006408h */
+	uint64_t	guest_linear_address;			/* 0000640Ah */
+
+	/* Natural width guest state fields */
+	uint64_t	guest_cr0;				/* 00006800h */
+	uint64_t	guest_cr3;				/* 00006802h */
+	uint64_t	guest_cr4;				/* 00006804h */
+	uint64_t	guest_es_base;				/* 00006806h */
+	uint64_t	guest_cs_base;				/* 00006808h */
+	uint64_t	guest_ss_base;				/* 0000680Ah */
+	uint64_t	guest_ds_base;				/* 0000680Ch */
+	uint64_t	guest_fs_base;				/* 0000680Eh */
+	uint64_t	guest_gs_base;				/* 00006810h */
+	uint64_t	guest_ldtr_base;			/* 00006812h */
+	uint64_t	guest_tr_base;				/* 00006814h */
+	uint64_t	guest_gdtr_base;			/* 00006816h */
+	uint64_t	guest_idtr_base;			/* 00006818h */
+	uint64_t	guest_dr7;				/* 0000681Ah */
+	uint64_t	guest_rsp;				/* 0000681Ch */
+	uint64_t	guest_rip;				/* 0000681Eh */
+	uint64_t	guest_rflags;				/* 00006820h */
+	uint64_t	guest_pending_debug_exceptions;		/* 00006822h */
+	uint64_t	guest_sysenter_esp;			/* 00006824h */
+	uint64_t	guest_sysenter_eip;			/* 00006826h */
+
+	/* Natural width host state fields */
+	uint64_t	host_cr0;				/* 00006C00h */
+	uint64_t	host_cr3;				/* 00006C02h */
+	uint64_t	host_cr4;				/* 00006C04h */
+	uint64_t	host_fs_base;				/* 00006C06h */
+	uint64_t	host_gs_base;				/* 00006C08h */
+	uint64_t	host_tr_base;				/* 00006C0Ah */
+	uint64_t	host_gdtr_base;				/* 00006C0Ch */
+	uint64_t	host_idtr_base;				/* 00006C0Eh */
+	uint64_t	host_sysenter_esp;			/* 00006C10h */
+	uint64_t	host_sysenter_eip;			/* 00006C12h */
+	uint64_t	host_rsp;				/* 00006C14h */
+	uint64_t	host_rip;				/* 00006C16h */
 };
 
 struct vmx_invvpid_descriptor
@@ -889,6 +1109,15 @@ struct vcpu_gueststate
  * Virtual Machine
  */
 struct vm;
+
+/*
+ * VMCS VMX modes
+ */
+enum {
+	VMCS_VMX_MODE_NONE,
+	VMCS_VMX_MODE_ROOT,
+	VMCS_VMX_MODE_NONROOT,
+};
 
 /*
  * Virtual CPU
@@ -961,6 +1190,14 @@ struct vcpu {
 	uint8_t vc_vmx_vpid_enabled;
 	uint64_t vc_vmx_cr0_fixed1;
 	uint64_t vc_vmx_cr0_fixed0;
+
+	/* Nesting */
+	uint8_t	vc_vmcs_vmx_mode;
+	uint64_t vc_vmxon_region_pa;
+	uint64_t vc_current_vmcs_pa;
+	uint64_t vc_ia32_feature_control_msr;
+	uint64_t vc_vmx_cr3_targets[VMX_MAX_CR3_TARGETS];
+	struct vmcs *vc_current_vmcs;
 
 	/* SVM only */
 	vaddr_t vc_svm_hsa_va;

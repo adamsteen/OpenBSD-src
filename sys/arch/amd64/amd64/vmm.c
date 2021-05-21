@@ -42,7 +42,7 @@
 #include <dev/isa/isareg.h>
 #include <dev/pv/pvreg.h>
 
-/* #define VMM_DEBUG */
+#define VMM_DEBUG
 
 void *l1tf_flush_region;
 
@@ -128,7 +128,8 @@ int vm_rwregs(struct vm_rwregs_params *, int);
 int vm_mprotect_ept(struct vm_mprotect_ept_params *);
 int vm_rwvmparams(struct vm_rwvmparams_params *, int);
 int vm_find(uint32_t, struct vm **);
-int vcpu_readregs_vmx(struct vcpu *, uint64_t, struct vcpu_reg_state *);
+int vmm_translate_gva(struct vcpu *, uint64_t, uint64_t *, int);
+int vcpu_readregs_vmx(struct vcpu *, uint64_t, struct vcpu_reg_state *, int);
 int vcpu_readregs_svm(struct vcpu *, uint64_t, struct vcpu_reg_state *);
 int vcpu_writeregs_vmx(struct vcpu *, uint64_t, int, struct vcpu_reg_state *);
 int vcpu_writeregs_svm(struct vcpu *, uint64_t, struct vcpu_reg_state *);
@@ -172,8 +173,17 @@ int svm_handle_inout(struct vcpu *);
 int vmx_handle_inout(struct vcpu *);
 int svm_handle_hlt(struct vcpu *);
 int vmx_handle_hlt(struct vcpu *);
-int vmm_inject_ud(struct vcpu *);
+int vmx_handle_vmxon(struct vcpu *);
+int vmx_handle_vmxoff(struct vcpu *);
+int vmx_handle_vmclear(struct vcpu *);
+int vmx_handle_vmptrld(struct vcpu *);
+int vmx_handle_vmptrst(struct vcpu *);
+int vmx_handle_vmwrite(struct vcpu *);
+int vmx_handle_vmread(struct vcpu *);
+int vmx_handle_vmlaunch(struct vcpu *);
+int vmx_handle_vmresume(struct vcpu *);
 int vmm_inject_gp(struct vcpu *);
+int vmm_inject_ud(struct vcpu *);
 int vmm_inject_db(struct vcpu *);
 void vmx_handle_intr(struct vcpu *);
 void vmx_handle_intwin(struct vcpu *);
@@ -304,6 +314,22 @@ extern struct gate_descriptor *idt;
 #define CR_READ		1
 #define CR_CLTS		2
 #define CR_LMSW		3
+
+/*
+ * VMX nesting macros for handling success/fail flags in %rflags
+ */
+#define VMsucceed(vcpu) \
+	vcpu->vc_gueststate.vg_rflags &= ~(PSL_C | PSL_PF | PSL_AF | PSL_Z | \
+	    PSL_N | PSL_V)
+
+#define VMfailInvalid(vcpu) \
+	vcpu->vc_gueststate.vg_rflags &= ~(PSL_PF | PSL_AF | PSL_Z | PSL_N | \
+	    PSL_V) | PSL_C
+
+#define VMfailValid(vcpu, err) \
+	vcpu->vc_gueststate.vg_rflags &= ~(PSL_C | PSL_PF | PSL_AF | PSL_N | \
+	    PSL_V) | PSL_Z; \
+	vcpu->vc_current_vmcs->instruction_error = err;
 
 /*
  * vmm_enabled
@@ -810,7 +836,7 @@ vm_rwregs(struct vm_rwregs_params *vrwp, int dir)
 	if (vmm_softc->mode == VMM_MODE_VMX ||
 	    vmm_softc->mode == VMM_MODE_EPT)
 		return (dir == 0) ?
-		    vcpu_readregs_vmx(vcpu, vrwp->vrwp_mask, vrs) :
+		    vcpu_readregs_vmx(vcpu, vrwp->vrwp_mask, vrs, 1) :
 		    vcpu_writeregs_vmx(vcpu, vrwp->vrwp_mask, 1, vrs);
 	else if (vmm_softc->mode == VMM_MODE_SVM ||
 	    vmm_softc->mode == VMM_MODE_RVI)
@@ -917,7 +943,7 @@ vm_mprotect_ept(struct vm_mprotect_ept_params *vmep)
 	/* No execute only on EPT CPUs that don't have that capability */
 	if (vmm_softc->mode == VMM_MODE_EPT) {
 		msr = rdmsr(IA32_VMX_EPT_VPID_CAP);
-		if (prot == PROT_EXEC &&
+		if (prot == PROT_EXEC && 
 		    (msr & IA32_EPT_VPID_CAP_XO_TRANSLATIONS) == 0) {
 			DPRINTF("%s: Execute only permissions unsupported,"
 			   " adding read permission\n", __func__);
@@ -1747,6 +1773,8 @@ vcpu_reload_vmcs_vmx(uint64_t *vmcs)
  *  vcpu: the vcpu to read register values from
  *  regmask: the types of registers to read
  *  vrs: output parameter where register values are stored
+ *  clear: 1 if the VMCS should be reloaded on entry and
+ *   cleared on return
  *
  * Return values:
  *  0: if successful
@@ -1754,7 +1782,7 @@ vcpu_reload_vmcs_vmx(uint64_t *vmcs)
  */
 int
 vcpu_readregs_vmx(struct vcpu *vcpu, uint64_t regmask,
-    struct vcpu_reg_state *vrs)
+    struct vcpu_reg_state *vrs, int clear)
 {
 	int i, ret = 0;
 	uint64_t sel, limit, ar;
@@ -1765,7 +1793,7 @@ vcpu_readregs_vmx(struct vcpu *vcpu, uint64_t regmask,
 	struct vcpu_segment_info *sregs = vrs->vrs_sregs;
 	struct vmx_msr_store *msr_store;
 
-	if (vcpu_reload_vmcs_vmx(&vcpu->vc_control_pa))
+	if (clear && vcpu_reload_vmcs_vmx(&vcpu->vc_control_pa))
 		return (EINVAL);
 
 	if (regmask & VM_RWREGS_GPRS) {
@@ -1865,7 +1893,7 @@ vcpu_readregs_vmx(struct vcpu *vcpu, uint64_t regmask,
 errout:
 	ret = EINVAL;
 out:
-	if (vmclear(&vcpu->vc_control_pa))
+	if (clear && vmclear(&vcpu->vc_control_pa))
 		ret = EINVAL;
 	return (ret);
 }
@@ -2340,6 +2368,7 @@ vcpu_reset_regs_svm(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 	/* Setup MSR bitmap */
 	memset((uint8_t *)vcpu->vc_msr_bitmap_va, 0xFF, 2 * PAGE_SIZE);
 	vmcb->v_msrpm_pa = (uint64_t)(vcpu->vc_msr_bitmap_pa);
+	/* XXX RW for MSR_IA32_FEATURE_CONTROL? */
 	svm_setmsrbrw(vcpu, MSR_IA32_FEATURE_CONTROL);
 	svm_setmsrbrw(vcpu, MSR_SYSENTER_CS);
 	svm_setmsrbrw(vcpu, MSR_SYSENTER_ESP);
@@ -2894,11 +2923,13 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 	}
 
 	if (vcpu_vmx_compute_ctrl(ctrlval, ctrl, want1, want0, &entry)) {
+		DPRINTF("%s: error computing entry controls\n", __func__);
 		ret = EINVAL;
 		goto exit;
 	}
 
 	if (vmwrite(VMCS_ENTRY_CTLS, entry)) {
+		DPRINTF("%s: error setting entry controls\n", __func__);
 		ret = EINVAL;
 		goto exit;
 	}
@@ -3174,7 +3205,6 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 	 * Set up the MSR bitmap
 	 */
 	memset((uint8_t *)vcpu->vc_msr_bitmap_va, 0xFF, PAGE_SIZE);
-	vmx_setmsrbrw(vcpu, MSR_IA32_FEATURE_CONTROL);
 	vmx_setmsrbrw(vcpu, MSR_SYSENTER_CS);
 	vmx_setmsrbrw(vcpu, MSR_SYSENTER_ESP);
 	vmx_setmsrbrw(vcpu, MSR_SYSENTER_EIP);
@@ -4353,7 +4383,7 @@ vmm_translate_gva(struct vcpu *vcpu, uint64_t va, uint64_t *pa, int mode)
 
 	if (vmm_softc->mode == VMM_MODE_EPT ||
 	    vmm_softc->mode == VMM_MODE_VMX) {
-		if (vcpu_readregs_vmx(vcpu, VM_RWREGS_ALL, &vrs))
+		if (vcpu_readregs_vmx(vcpu, VM_RWREGS_ALL, &vrs, 0))
 			return (EINVAL);
 	} else if (vmm_softc->mode == VMM_MODE_RVI ||
 	    vmm_softc->mode == VMM_MODE_SVM) {
@@ -4891,13 +4921,14 @@ vcpu_run_vmx(struct vcpu *vcpu, struct vm_run_params *vrp)
 #ifdef VMM_DEBUG
 			vmx_vcpu_dump_regs(vcpu);
 			dump_vcpu(vcpu);
+			vmx_dump_vmcs(vcpu);
 #endif /* VMM_DEBUG */
 			ret = EINVAL;
 		}
 	}
 
 	/* Copy the VCPU register state to the exit structure */
-	if (vcpu_readregs_vmx(vcpu, VM_RWREGS_ALL, &vcpu->vc_exit.vrs))
+	if (vcpu_readregs_vmx(vcpu, VM_RWREGS_ALL, &vcpu->vc_exit.vrs, 1))
 		ret = EINVAL;
 	vcpu->vc_exit.cpl = vmm_get_guest_cpu_cpl(vcpu);
 	/*
@@ -5219,21 +5250,48 @@ vmx_handle_exit(struct vcpu *vcpu)
 		break;
 	case VMX_EXIT_MWAIT:
 	case VMX_EXIT_MONITOR:
-	case VMX_EXIT_VMXON:
-	case VMX_EXIT_VMWRITE:
-	case VMX_EXIT_VMREAD:
-	case VMX_EXIT_VMLAUNCH:
-	case VMX_EXIT_VMRESUME:
-	case VMX_EXIT_VMPTRLD:
-	case VMX_EXIT_VMPTRST:
-	case VMX_EXIT_VMCLEAR:
 	case VMX_EXIT_VMCALL:
 	case VMX_EXIT_VMFUNC:
-	case VMX_EXIT_VMXOFF:
 	case VMX_EXIT_INVVPID:
 	case VMX_EXIT_INVEPT:
 		ret = vmm_inject_ud(vcpu);
 		update_rip = 0;
+		break;
+	case VMX_EXIT_VMXON:
+		ret = vmx_handle_vmxon(vcpu);
+		update_rip = 1;
+		break;
+	case VMX_EXIT_VMWRITE:
+		ret = vmx_handle_vmwrite(vcpu);
+		update_rip = 1;
+		break;
+	case VMX_EXIT_VMREAD:
+		ret = vmx_handle_vmread(vcpu);
+		update_rip = 1;
+		break;
+	case VMX_EXIT_VMLAUNCH:
+		ret = vmx_handle_vmlaunch(vcpu);
+		update_rip = 1;
+		break;
+	case VMX_EXIT_VMRESUME:
+		ret = vmx_handle_vmresume(vcpu);
+		update_rip = 1;
+		break;
+	case VMX_EXIT_VMPTRLD:
+		ret = vmx_handle_vmptrld(vcpu);
+		update_rip = 1;
+		break;
+	case VMX_EXIT_VMPTRST:
+		ret = vmx_handle_vmptrst(vcpu);
+		update_rip = 1;
+		break;
+	case VMX_EXIT_VMCLEAR:
+		ret = vmx_handle_vmclear(vcpu);
+		update_rip = 1;
+		break;
+	case VMX_EXIT_VMXOFF:
+		ret = vmx_handle_vmxoff(vcpu);
+		update_rip = 1;
 		break;
 	case VMX_EXIT_TRIPLE_FAULT:
 #ifdef VMM_DEBUG
@@ -5253,14 +5311,12 @@ vmx_handle_exit(struct vcpu *vcpu)
 	}
 
 	if (update_rip) {
-		if (vmwrite(VMCS_GUEST_IA32_RIP,
-		    vcpu->vc_gueststate.vg_rip)) {
+		if (vmwrite(VMCS_GUEST_IA32_RIP, vcpu->vc_gueststate.vg_rip)) {
 			printf("%s: can't advance rip\n", __func__);
 			return (EINVAL);
 		}
 
-		if (vmread(VMCS_GUEST_INTERRUPTIBILITY_ST,
-		    &istate)) {
+		if (vmread(VMCS_GUEST_INTERRUPTIBILITY_ST, &istate)) {
 			printf("%s: can't read interruptibility state\n",
 			    __func__);
 			return (EINVAL);
@@ -5269,8 +5325,7 @@ vmx_handle_exit(struct vcpu *vcpu)
 		/* Interruptibilty state 0x3 covers NMIs and STI */
 		istate &= ~0x3;
 
-		if (vmwrite(VMCS_GUEST_INTERRUPTIBILITY_ST,
-		    istate)) {
+		if (vmwrite(VMCS_GUEST_INTERRUPTIBILITY_ST, istate)) {
 			printf("%s: can't write interruptibility state\n",
 			    __func__);
 			return (EINVAL);
@@ -5471,9 +5526,14 @@ svm_fault_page(struct vcpu *vcpu, paddr_t gpa)
 
 	ret = uvm_fault(vcpu->vc_parent->vm_map, gpa, VM_FAULT_WIRE,
 	    PROT_READ | PROT_WRITE | PROT_EXEC);
-	if (ret)
+	if (ret) {
 		printf("%s: uvm_fault returns %d, GPA=0x%llx, rip=0x%llx\n",
 		    __func__, ret, (uint64_t)gpa, vcpu->vc_gueststate.vg_rip);
+#ifdef VMM_DEBUG
+		dump_vcpu(vcpu);
+#endif /* VMM_DEBUG */
+
+	}
 
 	return (ret);
 }
@@ -5544,9 +5604,15 @@ vmx_fault_page(struct vcpu *vcpu, paddr_t gpa)
 	ret = uvm_fault(vcpu->vc_parent->vm_map, gpa, VM_FAULT_WIRE,
 	    PROT_READ | PROT_WRITE | PROT_EXEC);
 
-	if (ret)
+	if (ret) {
 		printf("%s: uvm_fault returns %d, GPA=0x%llx, rip=0x%llx\n",
 		    __func__, ret, (uint64_t)gpa, vcpu->vc_gueststate.vg_rip);
+#ifdef VMM_DEBUG
+		vmx_vcpu_dump_regs(vcpu);
+		dump_vcpu(vcpu);
+		vmx_dump_vmcs(vcpu);
+#endif /* VMM_DEBUG */
+	}
 
 	return (ret);
 }
@@ -5749,11 +5815,12 @@ svm_handle_inout(struct vcpu *vcpu)
 	 *
 	 * XXX something better than a hardcoded list here, maybe
 	 * configure via vmd via the device list in vm create params?
+	 *
+	 * XXX handle not eax target
 	 */
 	switch (vcpu->vc_exit.vei.vei_port) {
 	case IO_ICU1 ... IO_ICU1 + 1:
 	case 0x40 ... 0x43:
-	case PCKBC_AUX:
 	case IO_RTC ... IO_RTC + 1:
 	case IO_ICU2 ... IO_ICU2 + 1:
 	case 0x3f8 ... 0x3ff:
@@ -5844,11 +5911,12 @@ vmx_handle_inout(struct vcpu *vcpu)
 	 *
 	 * XXX something better than a hardcoded list here, maybe
 	 * configure via vmd via the device list in vm create params?
+	 *
+	 * XXX handle not eax target
 	 */
 	switch (vcpu->vc_exit.vei.vei_port) {
 	case IO_ICU1 ... IO_ICU1 + 1:
 	case 0x40 ... 0x43:
-	case PCKBC_AUX:
 	case IO_RTC ... IO_RTC + 1:
 	case IO_ICU2 ... IO_ICU2 + 1:
 	case 0x3f8 ... 0x3ff:
@@ -5865,7 +5933,7 @@ vmx_handle_inout(struct vcpu *vcpu)
 		/* Read from unsupported ports returns FFs */
 		if (vcpu->vc_exit.vei.vei_dir == VEI_DIR_IN) {
 			if (vcpu->vc_exit.vei.vei_size == 4)
-				vcpu->vc_gueststate.vg_rax |= 0xFFFFFFFF;
+				vcpu->vc_gueststate.vg_rax = 0xFFFFFFFF;
 			else if (vcpu->vc_exit.vei.vei_size == 2)
 				vcpu->vc_gueststate.vg_rax |= 0xFFFF;
 			else if (vcpu->vc_exit.vei.vei_size == 1)
@@ -6251,10 +6319,10 @@ vmx_handle_cr(struct vcpu *vcpu)
  * vmx_handle_rdmsr
  *
  * Handler for rdmsr instructions. Bitmap MSRs are allowed implicit access
- * and won't end up here. This handler is primarily intended to catch otherwise
- * unknown MSR access for possible later inclusion in the bitmap list. For
- * each MSR access that ends up here, we log the access (when VMM_DEBUG is
- * enabled)
+ * and won't end up here. This handler is primarily intended to catch the VMX
+ * MSR reads and otherwise unknown MSR access (for possible later inclusion in
+ * the bitmap list). For each unkown MSR access that ends up here, we log the
+ * access (when VMM_DEBUG is enabled).
  *
  * Parameters:
  *  vcpu: vcpu structure containing instruction info causing the exit
@@ -6296,6 +6364,284 @@ vmx_handle_rdmsr(struct vcpu *vcpu)
 	case MSR_CR_PAT:
 		*rax = (vcpu->vc_shadow_pat & 0xFFFFFFFFULL);
 		*rdx = (vcpu->vc_shadow_pat >> 32);
+		break;
+	/*
+	 * XXX -
+	 * all these VMX MSRs need to consider what the host can do
+	 */
+	case IA32_VMX_BASIC:
+		/*
+		 * Bits 31:0  - Revision ID
+		 * Bits 32:44 - Region Size
+		 * No 32-bit VMX physaddr limit (bit 48)
+		 * No dual monitor treatment (bit 49)
+		 * Bits 50:53 - Cache mode (0x6 = WB)
+		 * No extended in/out reporting (bit 54)
+		 * No true controls (bit 55)
+		 *
+		 */
+		*rax = VMX_NESTED_VMCS_REVID;
+		*rdx = VMX_NESTED_REGION_SIZE |
+		    (VMX_NESTED_VMCS_CACHE_MODE << 18);
+		DPRINTF("%s: returning nested VMX basic MSR value "
+		    "0x%x:0x%x\n", __func__, (uint32_t)*rdx, (uint32_t)*rax);
+		break;
+	case IA32_VMX_PINBASED_CTLS:
+		/*
+		 * Control bits that can be 0:
+		 *  All except bits 1, 2, and 4
+		 * Control bits that can be 1:
+		 *  IA32_VMX_EXTERNAL_INT_EXITING
+		 *  IA32_VMX_NMI_EXITING
+		 */
+		*rax = (1 << 1) | (1 << 2) | (1 << 4);
+		*rdx = (IA32_VMX_EXTERNAL_INT_EXITING |
+		    IA32_VMX_NMI_EXITING) |
+		    (1 << 1) |
+		    (1 << 2) |
+		    (1 << 4);
+		DPRINTF("%s: returning nested VMX pinbased MSR value "
+		    "0x%x:0x%x\n", __func__, (uint32_t)*rdx, (uint32_t)*rax);
+		break;
+	case IA32_VMX_PROCBASED_CTLS:
+		/*
+		 * Control bits that can be 0:
+		 *  All except bits 1, 4-6, 8, 13-16, 26
+		 * Control bits that can be 1:
+		 *  IA32_VMX_INTERRUPT_WINDOW_EXITING
+		 *  IA32_VMX_USE_TSC_OFFSETTING
+		 *  IA32_VMX_HLT_EXITING
+		 *  IA32_VMX_INVLPG_EXITING
+		 *  IA32_VMX_RDTSC_EXITING
+		 *  IA32_VMX_CR3_LOAD_EXITING
+		 *  IA32_VMX_CR3_STORE_EXITING
+		 *  IA32_VMX_CR8_LOAD_EXITING
+		 *  IA32_VMX_CR8_STORE_EXITING
+		 *  IA32_VMX_MWAIT_EXITING
+		 *  IA32_VMX_MONITOR_EXITING
+		 *  IA32_VMX_MOV_DR_EXITING
+		 *  IA32_VMX_UNCONDITIONAL_IO_EXITING
+		 *  IA32_VMX_USE_IO_BITMAPS
+		 *  IA32_VMX_USE_MSR_BITMAPS
+		 *  IA32_VMX_USE_TPR_SHADOW
+		 *  IA32_VMX_ACTIVATE_SECONDARY_CONTROLS
+		 */
+		*rax = (1 << 1) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 8) |
+		    (1 << 13) | (1 << 14) | /* (1 << 15) | (1 << 16) | */ (1 << 26);
+		*rdx = (IA32_VMX_INTERRUPT_WINDOW_EXITING |
+		    IA32_VMX_USE_TSC_OFFSETTING |
+		    IA32_VMX_HLT_EXITING | IA32_VMX_INVLPG_EXITING |
+		    IA32_VMX_RDTSC_EXITING | IA32_VMX_CR3_LOAD_EXITING |
+		    IA32_VMX_CR3_STORE_EXITING |
+		    IA32_VMX_CR8_LOAD_EXITING |
+		    IA32_VMX_CR8_STORE_EXITING |
+		    IA32_VMX_MOV_DR_EXITING |
+		    IA32_VMX_UNCONDITIONAL_IO_EXITING |
+		    IA32_VMX_USE_IO_BITMAPS |
+		    IA32_VMX_USE_MSR_BITMAPS |
+		    IA32_VMX_MWAIT_EXITING |
+		    IA32_VMX_MONITOR_EXITING |
+		    IA32_VMX_USE_TPR_SHADOW |
+		    IA32_VMX_ACTIVATE_SECONDARY_CONTROLS |
+		    (1 << 1) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 8) |
+		    (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16) | (1 << 26));
+		DPRINTF("%s: returning nested VMX procbased MSR value "
+		    "0x%x:0x%x\n", __func__, (uint32_t)*rdx, (uint32_t)*rax);
+		break;
+	case IA32_VMX_EXIT_CTLS:
+		/*
+		 * Control bits that can be 0:
+		 *  All except bits 0-8, 10, 11, 13, 14, 16, 17
+		 * Control bits that can be 1:
+		 *  IA32_VMX_SAVE_DEBUG_CONTROLS
+		 *  IA32_VMX_HOST_SPACE_ADDRESS_SIZE
+		 *  IA32_VMX_LOAD_IA32_PERF_GLOBAL_CTRL_ON_EXIT
+		 *  IA32_VMX_ACKNOWLEDGE_INTERRUPT_ON_EXIT
+		 *  IA32_VMX_SAVE_IA32_PAT_ON_EXIT
+		 *  IA32_VMX_LOAD_IA32_PAT_ON_EXIT
+		 *  IA32_VMX_SAVE_IA32_EFER_ON_EXIT
+		 *  IA32_VMX_LOAD_IA32_EFER_ON_EXIT
+		 *  IA32_VMX_SAVE_VMX_PREEMPTION_TIMER
+		 *  IA32_VMX_CLEAR_IA32_BNDCFGS_ON_EXIT
+		 */
+		*rax = 0x365FF; /* See bit combination above */
+		*rdx = (IA32_VMX_SAVE_DEBUG_CONTROLS |
+		    IA32_VMX_HOST_SPACE_ADDRESS_SIZE |
+		    IA32_VMX_LOAD_IA32_PERF_GLOBAL_CTRL_ON_EXIT |
+		    IA32_VMX_ACKNOWLEDGE_INTERRUPT_ON_EXIT |
+		    IA32_VMX_SAVE_IA32_PAT_ON_EXIT |
+		    IA32_VMX_LOAD_IA32_PAT_ON_EXIT |
+		    IA32_VMX_SAVE_IA32_EFER_ON_EXIT |
+		    IA32_VMX_LOAD_IA32_EFER_ON_EXIT |
+		    IA32_VMX_SAVE_VMX_PREEMPTION_TIMER |
+		    IA32_VMX_CLEAR_IA32_BNDCFGS_ON_EXIT |
+		    0x365FF); /* See bit combination above */
+		DPRINTF("%s: returning nested VMX exit MSR value "
+		    "0x%x:0x%x\n", __func__, (uint32_t)*rdx, (uint32_t)*rax);
+		break;
+	case IA32_VMX_ENTRY_CTLS:
+		/*
+		 * Control bits that can be 0:
+		 *  All except bits 0-8, 12
+		 * Control bits that can be 1:
+		 *  IA32_VMX_LOAD_DEBUG_CONTROLS
+		 *  IA32_VMX_IA32E_MODE_GUEST
+		 *  IA32_VMX_LOAD_IA32_PERF_GLOBAL_CTRL_ON_ENTRY
+		 *  IA32_VMX_LOAD_IA32_PAT_ON_ENTRY
+		 *  IA32_VMX_LOAD_IA32_EFER_ON_ENTRY
+		 *  IA32_VMX_LOAD_IA32_BNDCFGS_ON_ENTRY
+		 */
+		*rax = 0x11FF; /* See bit combination above */
+		*rdx = (IA32_VMX_LOAD_DEBUG_CONTROLS |
+		    IA32_VMX_IA32E_MODE_GUEST |
+		    IA32_VMX_LOAD_IA32_PERF_GLOBAL_CTRL_ON_ENTRY |
+		    IA32_VMX_LOAD_IA32_PAT_ON_ENTRY |
+		    IA32_VMX_LOAD_IA32_EFER_ON_ENTRY |
+		    IA32_VMX_LOAD_IA32_BNDCFGS_ON_ENTRY |
+		    0x11FF); /* See bit combination above */
+		DPRINTF("%s: returning nested VMX entry MSR value "
+		    "0x%x:0x%x\n", __func__, (uint32_t)*rdx, (uint32_t)*rax);
+		break;
+	case IA32_VMX_MISC:
+		/*
+		 * Bits 0:4   - TSC preemption rate
+		 * Bit  5     - EFER.LMA -> IA32e Mode Guest
+		 * Bits 6:8   - Activity state support (HLT + ACT)
+		 * Bit  14    - Intel PT support in VMX (0)
+		 * Bit  15    - RDMSR(SMBASE) in SMM (0)
+		 * Bits 16:24 - Max CR3 Targets (256)
+		 * Bits 25:27 - MSR store/load list count (0 == 512)
+		 * Bit  28    - SMM_MONITOR_CTL treatment (0)
+		 * Bit  29    - VMWRITE to exit field support (0)
+		 * Bit  30    - Injection with insn length 0 (0)
+		 * Bit  32:63 - MSEG revision (0)
+		 */
+		*rax = VMX_MISC_TSC_PREEMPTION_RATE |
+		    (1 << 5) | (VMX_MISC_ACTIVITY_STATE << 6);
+		*rdx = 0;
+		DPRINTF("%s: returning nested VMX misc MSR value "
+		    "0x%x:0x%x\n", __func__, (uint32_t)*rdx, (uint32_t)*rax);
+		break;
+	case IA32_VMX_CR0_FIXED0:
+		/*
+		 * No bits fixed to 0 in CR0
+		 */
+		*rax = 0;
+		*rdx = 0;
+		DPRINTF("%s: returning nested VMX CR0 fixed0 MSR value "
+		    "0x%x:0x%x\n", __func__, (uint32_t)*rdx, (uint32_t)*rax);
+		break;
+	case IA32_VMX_CR0_FIXED1:
+		/*
+		 * No bits fixed to 1 in CR0
+		 */
+		*rax = 0xFFFFFFFF;
+		*rdx = 0xFFFFFFFF;
+		DPRINTF("%s: returning nested VMX CR0 fixed1 MSR value "
+		    "0x%x:0x%x\n", __func__, (uint32_t)*rdx, (uint32_t)*rax);
+		break;
+	case IA32_VMX_CR4_FIXED0:
+		/*
+		 * No bits fixed to 0 in CR4
+		 * CR4.VMXE must be set
+		 */
+		*rax = CR4_VMXE;
+		*rdx = 0;
+		DPRINTF("%s: returning nested VMX CR4 fixed0 MSR value "
+		    "0x%x:0x%x\n", __func__, (uint32_t)*rdx, (uint32_t)*rax);
+		break;
+	case IA32_VMX_CR4_FIXED1:
+		/*
+		 * CR4.VMXE must be set
+		 */
+		*rax = 0xFFFFFFFF;
+		*rdx = 0xFFFFFFFF;
+		DPRINTF("%s: returning nested VMX CR4 fixed1 MSR value "
+		    "0x%x:0x%x\n", __func__, (uint32_t)*rdx, (uint32_t)*rax);
+		break;
+	case IA32_VMX_VMCS_ENUM:
+		/*
+		 * "Bits 9:1 contain the maximum index of any supported
+		 *  VMCS field on this processor"
+		 */
+		*rax = 0x33;	/* Corresponds to 00002033h */
+		*rdx = 0;
+		DPRINTF("%s: returning nested VMX VMCS enum MSR value "
+		    "0x%x:0x%x\n", __func__, (uint32_t)*rdx, (uint32_t)*rax);
+		break;
+	case IA32_VMX_PROCBASED2_CTLS:
+		/*
+		 * Control bits that can be 0:
+		 *  Any
+		 * Control bits that can be 1:
+		 *  IA32_VMX_ENABLE_EPT
+		 *  IA32_VMX_ENABLE_RDTSCP
+		 *  IA32_VMX_ENABLE_VPID - XXX
+		 *  IA32_VMX_WBINVD_EXITING
+		 *  IA32_VMX_UNRESTRICTED_GUEST
+		 *  IA32_VMX_PAUSE_LOOP_EXITING
+		 *  IA32_VMX_RDRAND_EXITING
+		 *  IA32_VMX_ENABLE_INVPCID
+		 *  IA32_VMX_ENABLE_VM_FUNCTIONS
+		 *  IA32_VMX_RDSEED_EXITING
+		 *  IA32_VMX_EPT_VIOLATION_VE
+		 */
+		*rax = 0;
+		*rdx = (IA32_VMX_ENABLE_EPT | IA32_VMX_ENABLE_RDTSCP |
+		    /* IA32_VMX_ENABLE_VPID | */ IA32_VMX_WBINVD_EXITING |
+		    IA32_VMX_UNRESTRICTED_GUEST |
+		    IA32_VMX_PAUSE_LOOP_EXITING |
+		    IA32_VMX_RDRAND_EXITING |
+		    IA32_VMX_ENABLE_INVPCID |
+		    IA32_VMX_ENABLE_VM_FUNCTIONS |
+		    IA32_VMX_RDSEED_EXITING |
+		    IA32_VMX_EPT_VIOLATION_VE);
+		DPRINTF("%s: returning nested VMX procbased2 MSR value "
+		    "0x%x:0x%x\n", __func__, (uint32_t)*rdx, (uint32_t)*rax);
+		break;
+	case IA32_VMX_EPT_VPID_CAP:
+		/*
+		 * Bit 0 - XO supported
+		 * Bit 6 - EPT page walk depth 4
+		 * Bit 8 - EPT UC memory type supported
+		 * Bit 14 - EPT WB memory type supported
+		 * Bit 16 - EPT 2MB page size supported
+		 * Bit 17 - EPT 1GB page size supported
+		 * Bit 20 - INVEPT supported
+		 * Bit 21 - EPT A/D bits supported
+		 * Bit 22 - EPT Advanced information on EPT viol
+		 * Bit 25 - INVEPT single ctx supported
+		 * Bit 26 - INVEPT all ctx supported
+		 * Bit 32 - INVVPID supported
+		 * Bit 40 - INVVPID individual addr supported
+		 * Bit 41 - INVVPID single ctx supported
+		 * Bit 42 - INVVPID all ctx supported
+		 * Bit 43 - INVVPID single ctx with globals supported
+		 */
+		*rax = (IA32_EPT_VPID_CAP_XO |
+		    IA32_EPT_VPID_CAP_PAGE_WALK_4 |
+		    IA32_EPT_VPID_CAP_WB |
+		    IA32_EPT_VPID_CAP_2MB |
+		    IA32_EPT_VPID_CAP_1GB |
+		    IA32_EPT_VPID_CAP_INVEPT |
+		    IA32_EPT_VPID_CAP_AD_BITS |
+		    IA32_EPT_VPID_CAP_EPT_ADVANCED |
+		    IA32_EPT_VPID_CAP_INVEPT_SINGLE |
+		    IA32_EPT_VPID_CAP_INVEPT_ALL);
+		*rdx = (IA32_EPT_VPID_CAP_INVVPID |
+		    IA32_EPT_VPID_CAP_INVVPID_INDIV |
+		    IA32_EPT_VPID_CAP_INVVPID_SINGLE |
+		    IA32_EPT_VPID_CAP_INVVPID_ALL |
+		    IA32_EPT_VPID_CAP_INVVPID_SINGLE_GLOBAL) >> 32;
+		DPRINTF("%s: returning nested VMX EPT/VPID cap MSR "
+		    "0x%x:0x%x\n", __func__, (uint32_t)*rdx, (uint32_t)*rax);
+		break;
+	case IA32_VMX_VMFUNC:
+		/* Bit 0 - EPTP switching */
+		*rax = IA32_VMX_VMFUNC_EPTP_SWITCHING;
+		*rdx = 0;
+		DPRINTF("%s: returning nested VMX EPT/VPID cap MSR "
+		    "0x%x:0x%x\n", __func__, (uint32_t)*rdx, (uint32_t)*rax);
 		break;
 	default:
 		/* Unsupported MSRs causes #GP exception, don't advance %rip */
@@ -6497,6 +6843,12 @@ vmx_handle_wrmsr(struct vcpu *vcpu)
 			return (ret);
 		}
 		vcpu->vc_shadow_pat = val;
+		break;
+	case MSR_IA32_FEATURE_CONTROL:
+		DPRINTF("%s: setting IA32_FEATURE_CONTROL=0x%x:0x%x\n",
+		    __func__, (uint32_t)*rdx, (uint32_t)*rax);
+		vcpu->vc_ia32_feature_control_msr = (uint32_t)*rax |
+		    (*rdx << 32);
 		break;
 	case MSR_MISC_ENABLE:
 		vmx_handle_misc_enable_msr(vcpu);
@@ -7202,8 +7554,7 @@ vmm_alloc_vpid(uint16_t *vpid)
 		if (!(sc->vpids[idx] & (1 << bit))) {
 			sc->vpids[idx] |= (1 << bit);
 			*vpid = i;
-			DPRINTF("%s: allocated VPID/ASID %d\n", __func__,
-			    i);
+			DPRINTF("%s: allocated VPID/ASID %d\n", __func__, i);
 			rw_exit_write(&vmm_softc->vpid_lock);
 			return 0;
 		}
@@ -7347,6 +7698,1670 @@ vmm_pat_is_valid(uint64_t pat)
 	}
 
 	return 1;
+}
+
+/*
+ * vmx_handle_vmclear
+ *
+ * Handler for vmclear instructions.
+ *
+ * Parameters:
+ *  vcpu: vcpu structure containing instruction info causing the exit
+ *
+ * Return value:
+ *  0: The operation was successful
+ *  EINVAL: An error occurred
+ */
+int
+vmx_handle_vmclear(struct vcpu *vcpu)
+{
+	uint64_t insn_length, rdi;
+
+	if (vmread(VMCS_INSTRUCTION_LENGTH, &insn_length)) {
+		printf("%s: can't obtain instruction length\n", __func__);
+		return (EINVAL);
+	}
+
+	/* XXX handle m64 other than (%rdi) */
+	rdi = vcpu->vc_gueststate.vg_rdi;
+
+	/* XXX log the access for now */
+	printf("%s: nested vmclear exit @ 0x%llx, vmcs=0x%llx\n",
+	    __func__, vcpu->vc_gueststate.vg_rip,
+	    rdi);
+
+	vcpu->vc_gueststate.vg_rip += insn_length;
+	VMsucceed(vcpu);
+
+	vcpu->vc_current_vmcs_pa = 0;
+	vcpu->vc_current_vmcs = 0;
+
+	if (vmwrite(VMCS_GUEST_IA32_RFLAGS, vcpu->vc_gueststate.vg_rflags)) {
+		printf("%s: error saving guest rflags\n", __func__);
+		return (EINVAL);
+	}
+
+	return (0);
+}
+
+/*
+ * vmx_handle_vmlaunch
+ *
+ * Handler for vmlaunch instructions.
+ *
+ * Parameters:
+ *  vcpu: vcpu structure containing instruction info causing the exit
+ *
+ * Return value:
+ *  0: The operation was successful
+ *  EINVAL: An error occurred
+ */
+int
+vmx_handle_vmlaunch(struct vcpu *vcpu)
+{
+	uint64_t insn_length;
+	uint64_t *rax;
+
+	if (vmread(VMCS_INSTRUCTION_LENGTH, &insn_length)) {
+		printf("%s: can't obtain instruction length\n", __func__);
+		return (EINVAL);
+	}
+
+	/* All VMLAUNCH instructions are 0x0F 0x01 0xC2 */
+	KASSERT(insn_length == 3);
+
+	rax = &vcpu->vc_gueststate.vg_rax;
+
+	/* XXX log the access for now */
+	printf("%s: nested vmlaunch exit @ 0x%llx, rax=0x%llx\n",
+	    __func__, vcpu->vc_gueststate.vg_rip,
+	    *rax);
+
+	vcpu->vc_gueststate.vg_rip += insn_length;
+
+//	return (0);
+	return (EINVAL);
+}
+
+/*
+ * vmx_handle_vmresume
+ *
+ * Handler for vmresume instructions.
+ *
+ * Parameters:
+ *  vcpu: vcpu structure containing instruction info causing the exit
+ *
+ * Return value:
+ *  0: The operation was successful
+ *  EINVAL: An error occurred
+ */
+int
+vmx_handle_vmresume(struct vcpu *vcpu)
+{
+	uint64_t insn_length;
+	uint64_t *rax;
+
+	if (vmread(VMCS_INSTRUCTION_LENGTH, &insn_length)) {
+		printf("%s: can't obtain instruction length\n", __func__);
+		return (EINVAL);
+	}
+
+	/* All VMRESUME instructions are 0x0F 0x01 0xC3 */
+	KASSERT(insn_length == 3);
+
+	rax = &vcpu->vc_gueststate.vg_rax;
+
+	/* XXX log the access for now */
+	printf("%s: nested vmresume exit @ 0x%llx, rax=0x%llx\n",
+	    __func__, vcpu->vc_gueststate.vg_rip,
+	    *rax);
+
+	vcpu->vc_gueststate.vg_rip += insn_length;
+
+//	return (0);
+	return (EINVAL);
+}
+
+/*
+ * vmx_handle_vmptrld
+ *
+ * Handler for vmptrld instructions.
+ *
+ * Parameters:
+ *  vcpu: vcpu structure containing instruction info causing the exit
+ *
+ * Return value:
+ *  0: The operation was successful
+ *  EINVAL: An error occurred
+ */
+int
+vmx_handle_vmptrld(struct vcpu *vcpu)
+{
+	uint64_t insn_length, rdi, tmp;
+	paddr_t hpa;
+
+	if (vmread(VMCS_INSTRUCTION_LENGTH, &insn_length)) {
+		printf("%s: can't obtain instruction length\n", __func__);
+		return (EINVAL);
+	}
+
+	/* XXX handle m64 other than (%rdi) */
+	rdi = vcpu->vc_gueststate.vg_rdi;
+
+	DPRINTF("%s: nested vmptrld exit @ 0x%llx, rdi=0x%llx\n",
+	    __func__, vcpu->vc_gueststate.vg_rip, rdi);
+
+	/* XXX validate vmcs PA <= phys addr limit of this cpu */
+	/* XXX validate vmcs PA != VMXON PA */
+	/* XXX validate vmcs revision identifier */
+	DPRINTF("%s: nested vmptrld exit, rdi=0x%llx\n", __func__, rdi);
+	if (vmm_translate_gva(vcpu, rdi, &tmp, PROT_READ)) {
+		return (EINVAL);
+	}
+
+	if (!pmap_extract(vcpu->vc_parent->vm_map->pmap, tmp, &hpa)) {
+		return (EINVAL);
+	}
+
+	vcpu->vc_current_vmcs_pa =
+	    *((uint64_t *)PMAP_DIRECT_MAP((hpa | (tmp & 0xFFF))));
+	vcpu->vc_current_vmcs =
+	    (struct vmcs *)PMAP_DIRECT_MAP(vcpu->vc_current_vmcs_pa);
+
+	vcpu->vc_gueststate.vg_rip += insn_length;
+	VMsucceed(vcpu);
+
+	/* log the access */
+	DPRINTF("%s: nested vmptrld exit @ 0x%llx "
+	    "guest %%rdi 0x%llx, guest *%%rdi (PA) 0x%llx\n",
+	    __func__, vcpu->vc_gueststate.vg_rip, rdi,
+	    vcpu->vc_current_vmcs_pa);
+
+	if (vmwrite(VMCS_GUEST_IA32_RFLAGS, vcpu->vc_gueststate.vg_rflags)) {
+		printf("%s: error saving guest rflags\n", __func__);
+		return (EINVAL);
+	}
+
+	return (0);
+}
+
+/*
+ * vmx_handle_vmptrst
+ *
+ * Handler for vmptrst instructions.
+ *
+ * Parameters:
+ *  vcpu: vcpu structure containing instruction info causing the exit
+ *
+ * Return value:
+ *  0: The operation was successful
+ *  EINVAL: An error occurred
+ */
+int
+vmx_handle_vmptrst(struct vcpu *vcpu)
+{
+	uint64_t insn_length, rdi, tmp;
+	paddr_t hpa;
+
+	if (vmread(VMCS_INSTRUCTION_LENGTH, &insn_length)) {
+		printf("%s: can't obtain instruction length\n", __func__);
+		return (EINVAL);
+	}
+
+	/* XXX handle m64 other than (%rdi) */
+	rdi = vcpu->vc_gueststate.vg_rdi;
+
+	DPRINTF("%s: nested vmptrst exit, rdi=0x%llx, current vmcs "
+	    "ptr=0x%llx\n", __func__, rdi, vcpu->vc_current_vmcs_pa);
+
+	if (vmm_translate_gva(vcpu, rdi, &tmp, PROT_READ)) {
+		return (EINVAL);
+	}
+
+	if (!pmap_extract(vcpu->vc_parent->vm_map->pmap, tmp, &hpa)) {
+		return (EINVAL);
+	}
+
+	*((uint64_t *)PMAP_DIRECT_MAP((hpa | (tmp & 0xFFF)))) =
+	    vcpu->vc_current_vmcs_pa;
+
+	vcpu->vc_gueststate.vg_rip += insn_length;
+	VMsucceed(vcpu);
+
+	/* log the access */
+	DPRINTF("%s: nested vmptrst exit @ 0x%llx "
+	    "guest %%rdi 0x%llx, guest *%%rdi (PA) 0x%llx\n",
+	    __func__, vcpu->vc_gueststate.vg_rip, rdi,
+	    vcpu->vc_current_vmcs_pa);
+
+	if (vmwrite(VMCS_GUEST_IA32_RFLAGS, vcpu->vc_gueststate.vg_rflags)) {
+		printf("%s: error saving guest rflags\n", __func__);
+		return (EINVAL);
+	}
+
+	return (0);
+}
+
+/*
+ * vmx_handle_vmread
+ *
+ * Handler for vmread instructions.
+ *
+ * Parameters:
+ *  vcpu: vcpu structure containing instruction info causing the exit
+ *
+ * Return value:
+ *  0: The operation was successful
+ *  EINVAL: An error occurred
+ */
+int
+vmx_handle_vmread(struct vcpu *vcpu)
+{
+	uint64_t insn_length;
+	uint64_t rdi, *rsi, tmp;
+	paddr_t hpa;
+	struct vmcs *vmcs;
+
+	if (vmread(VMCS_INSTRUCTION_LENGTH, &insn_length)) {
+		printf("%s: can't obtain instruction length\n", __func__);
+		return (EINVAL);
+	}
+
+	/* We unconditionally emulate, so bump %rip now */
+	vcpu->vc_gueststate.vg_rip += insn_length;
+
+	/* XXX handle forms other than %rdi, %rsi */
+	rdi = vcpu->vc_gueststate.vg_rdi;
+	/* %rsi is a pointer to the target GVA */
+	rsi = (uint64_t *)vcpu->vc_gueststate.vg_rsi;
+
+	vmcs = vcpu->vc_current_vmcs;
+
+	DPRINTF("%s: nested vmread exit, rsi=0x%llx\n", __func__, (uint64_t)rsi);
+	if (vmm_translate_gva(vcpu, (uint64_t)rsi, &tmp, PROT_WRITE)) {
+		return (EINVAL);
+	}
+
+	if (!pmap_extract(vcpu->vc_parent->vm_map->pmap, tmp, &hpa)) {
+		return (EINVAL);
+	}
+
+	/* reuse rsi as target, now in host VA space */
+	rsi = (uint64_t *)PMAP_DIRECT_MAP((hpa | (tmp & 0xFFF)));
+
+	if (vcpu->vc_vmcs_vmx_mode == VMX_NESTING_MODE_NONE) {
+		VMfailInvalid(vcpu);
+		goto exit;
+	}
+
+	switch (rdi) {
+	case VMCS_GUEST_VPID:
+		*(uint16_t *)rsi = vmcs->vpid;
+		break;
+	case VMCS_POSTED_INT_NOTIF_VECTOR:
+		*(uint16_t *)rsi = vmcs->pi_notification_vector;
+		break;
+	case VMCS_EPTP_INDEX:
+		*(uint16_t *)rsi = vmcs->eptp_index;
+		break;
+	case VMCS_GUEST_IA32_ES_SEL:
+		*(uint16_t *)rsi = vmcs->guest_es_sel;
+		break;
+	case VMCS_GUEST_IA32_CS_SEL:
+		*(uint16_t *)rsi = vmcs->guest_cs_sel;
+		break;
+	case VMCS_GUEST_IA32_SS_SEL:
+		*(uint16_t *)rsi = vmcs->guest_ss_sel;
+		break;
+	case VMCS_GUEST_IA32_DS_SEL:
+		*(uint16_t *)rsi = vmcs->guest_ds_sel;
+		break;
+	case VMCS_GUEST_IA32_FS_SEL:
+		*(uint16_t *)rsi = vmcs->guest_fs_sel;
+		break;
+	case VMCS_GUEST_IA32_GS_SEL:
+		*(uint16_t *)rsi = vmcs->guest_gs_sel;
+		break;
+	case VMCS_GUEST_IA32_LDTR_SEL:
+		*(uint16_t *)rsi = vmcs->guest_ldtr_sel;
+		break;
+	case VMCS_GUEST_IA32_TR_SEL:
+		*(uint16_t *)rsi = vmcs->guest_tr_sel;
+		break;
+	case VMCS_GUEST_INTERRUPT_STATUS:
+		*(uint16_t *)rsi = vmcs->guest_intr_status;
+		break;
+	case VMCS_GUEST_PML_INDEX:
+		*(uint16_t *)rsi = vmcs->pml_index;
+		break;
+	case VMCS_HOST_IA32_ES_SEL:
+		*(uint16_t *)rsi = vmcs->host_es_sel;
+		break;
+	case VMCS_HOST_IA32_CS_SEL:
+		*(uint16_t *)rsi = vmcs->host_cs_sel;
+		break;
+	case VMCS_HOST_IA32_SS_SEL:
+		*(uint16_t *)rsi = vmcs->host_ss_sel;
+		break;
+	case VMCS_HOST_IA32_DS_SEL:
+		*(uint16_t *)rsi = vmcs->host_ds_sel;
+		break;
+	case VMCS_HOST_IA32_FS_SEL:
+		*(uint16_t *)rsi = vmcs->host_fs_sel;
+		break;
+	case VMCS_HOST_IA32_GS_SEL:
+		*(uint16_t *)rsi = vmcs->host_gs_sel;
+		break;
+	case VMCS_HOST_IA32_TR_SEL:
+		*(uint16_t *)rsi = vmcs->host_tr_sel;
+		break;
+	case VMCS_IO_BITMAP_A:
+		*rsi = vmcs->io_bitmap_a.full;
+		break;
+	case VMCS_IO_BITMAP_A_HI:
+		*rsi = vmcs->io_bitmap_a.hi;
+		break;
+	case VMCS_IO_BITMAP_B:
+		*rsi = vmcs->io_bitmap_b.full;
+		break;
+	case VMCS_IO_BITMAP_B_HI:
+		*rsi = vmcs->io_bitmap_b.hi;
+		break;
+	case VMCS_MSR_BITMAP_ADDRESS:
+		*rsi = vmcs->msr_bitmap_addr.full;
+		break;
+	case VMCS_MSR_BITMAP_ADDRESS_HI:
+		*rsi = vmcs->msr_bitmap_addr.hi;
+		break;
+	case VMCS_EXIT_STORE_MSR_ADDRESS:
+		*rsi = vmcs->exit_msr_store_addr.full;
+		break;
+	case VMCS_EXIT_STORE_MSR_ADDRESS_HI:
+		*rsi = vmcs->exit_msr_store_addr.hi;
+		break;
+	case VMCS_EXIT_LOAD_MSR_ADDRESS:
+		*rsi = vmcs->exit_msr_load_addr.full;
+		break;
+	case VMCS_EXIT_LOAD_MSR_ADDRESS_HI:
+		*rsi = vmcs->exit_msr_load_addr.hi;
+		break;
+	case VMCS_ENTRY_LOAD_MSR_ADDRESS:
+		*rsi = vmcs->entry_msr_load_addr.full;
+		break;
+	case VMCS_ENTRY_LOAD_MSR_ADDRESS_HI:
+		*rsi = vmcs->entry_msr_load_addr.hi;
+		break;
+	case VMCS_EXECUTIVE_VMCS_POINTER:
+		*rsi = vmcs->executive_vmcs_pointer.full;
+		break;
+	case VMCS_EXECUTIVE_VMCS_POINTER_HI:
+		*rsi = vmcs->executive_vmcs_pointer.hi;
+		break;
+	case VMCS_PML_ADDRESS:
+		*rsi = vmcs->pml_address.full;
+		break;
+	case VMCS_PML_ADDRESS_HI:
+		*rsi = vmcs->pml_address.hi;
+		break;
+	case VMCS_TSC_OFFSET:
+		*rsi = vmcs->tsc_offset.full;
+		break;
+	case VMCS_TSC_OFFSET_HI:
+		*rsi = vmcs->tsc_offset.hi;
+		break;
+	case VMCS_VIRTUAL_APIC_ADDRESS:
+		*rsi = vmcs->virtual_apic_address.full;
+		break;
+	case VMCS_VIRTUAL_APIC_ADDRESS_HI:
+		*rsi = vmcs->virtual_apic_address.hi;
+		break;
+	case VMCS_APIC_ACCESS_ADDRESS:
+		*rsi = vmcs->apic_accees_address.full;
+		break;
+	case VMCS_APIC_ACCESS_ADDRESS_HI:
+		*rsi = vmcs->apic_accees_address.hi;
+		break;
+	case VMCS_POSTED_INTERRUPT_DESC:
+		*rsi = vmcs->posted_int_desc_address.full;
+		break;
+	case VMCS_POSTED_INTERRUPT_DESC_HI:
+		*rsi = vmcs->posted_int_desc_address.hi;
+		break;
+	case VMCS_VM_FUNCTION_CONTROLS:
+		*rsi = vmcs->vm_function_controls.full;
+		break;
+	case VMCS_VM_FUNCTION_CONTROLS_HI:
+		*rsi = vmcs->vm_function_controls.hi;
+		break;
+	case VMCS_GUEST_IA32_EPTP:
+		*rsi = vmcs->eptp.full;
+		break;
+	case VMCS_GUEST_IA32_EPTP_HI:
+		*rsi = vmcs->eptp.hi;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_0:
+		*rsi = vmcs->eoi_exit_bitmap_0.full;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_0_HI:
+		*rsi = vmcs->eoi_exit_bitmap_0.hi;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_1:
+		*rsi = vmcs->eoi_exit_bitmap_1.full;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_1_HI:
+		*rsi = vmcs->eoi_exit_bitmap_1.hi;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_2:
+		*rsi = vmcs->eoi_exit_bitmap_2.full;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_2_HI:
+		*rsi = vmcs->eoi_exit_bitmap_2.hi;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_3:
+		*rsi = vmcs->eoi_exit_bitmap_3.full;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_3_HI:
+		*rsi = vmcs->eoi_exit_bitmap_3.hi;
+		break;
+	case VMCS_EPTP_LIST_ADDRESS:
+		*rsi = vmcs->eptp_list_address.full;
+		break;
+	case VMCS_EPTP_LIST_ADDRESS_HI:
+		*rsi = vmcs->eptp_list_address.hi;
+		break;
+	case VMCS_VMREAD_BITMAP_ADDRESS:
+		*rsi = vmcs->vmread_bitmap_address.full;
+		break;
+	case VMCS_VMREAD_BITMAP_ADDRESS_HI:
+		*rsi = vmcs->vmread_bitmap_address.hi;
+		break;
+	case VMCS_VMWRITE_BITMAP_ADDRESS:
+		*rsi = vmcs->vmwrite_bitmap_address.full;
+		break;
+	case VMCS_VMWRITE_BITMAP_ADDRESS_HI:
+		*rsi = vmcs->vmwrite_bitmap_address.hi;
+		break;
+	case VMCS_VIRTUALIZATION_EXC_ADDRESS:
+		*rsi = vmcs->virt_execption_info_address.full;
+		break;
+	case VMCS_VIRTUALIZATION_EXC_ADDRESS_HI:
+		*rsi = vmcs->virt_execption_info_address.hi;
+		break;
+	case VMCS_XSS_EXITING_BITMAP:
+		*rsi = vmcs->xss_exiting_bitmap.full;
+		break;
+	case VMCS_XSS_EXITING_BITMAP_HI:
+		*rsi = vmcs->xss_exiting_bitmap.hi;
+		break;
+	case VMCS_TSC_MULTIPLIER:
+		*rsi = vmcs->tsc_multiplier.full;
+		break;
+	case VMCS_TSC_MULTIPLIER_HI:
+		*rsi = vmcs->tsc_multiplier.hi;
+		break;
+	case VMCS_GUEST_PHYSICAL_ADDRESS:
+		*rsi = vmcs->guest_physical_address.full;
+		break;
+	case VMCS_GUEST_PHYSICAL_ADDRESS_HI:
+		*rsi = vmcs->guest_physical_address.hi;
+		break;
+	case VMCS_LINK_POINTER:
+		*rsi = vmcs->vmcs_link_pointer.full;
+		break;
+	case VMCS_LINK_POINTER_HI:
+		*rsi = vmcs->vmcs_link_pointer.hi;
+		break;
+	case VMCS_GUEST_IA32_DEBUGCTL:
+		*rsi = vmcs->guest_debugctl.full;
+		break;
+	case VMCS_GUEST_IA32_DEBUGCTL_HI:
+		*rsi = vmcs->guest_debugctl.hi;
+		break;
+	case VMCS_GUEST_IA32_PAT:
+		*rsi = vmcs->guest_pat.full;
+		break;
+	case VMCS_GUEST_IA32_PAT_HI:
+		*rsi = vmcs->guest_pat.hi;
+		break;
+	case VMCS_GUEST_IA32_EFER:
+		*rsi = vmcs->guest_efer.full;
+		break;
+	case VMCS_GUEST_IA32_EFER_HI:
+		*rsi = vmcs->guest_efer.hi;
+		break;
+	case VMCS_GUEST_IA32_PERF_GBL_CTRL:
+		*rsi = vmcs->guest_perf_global_ctrl.full;
+		break;
+	case VMCS_GUEST_IA32_PERF_GBL_CTRL_HI:
+		*rsi = vmcs->guest_perf_global_ctrl.hi;
+		break;
+	case VMCS_GUEST_PDPTE0:
+		*rsi = vmcs->guest_pdpte0.full;
+		break;
+	case VMCS_GUEST_PDPTE0_HI:
+		*rsi = vmcs->guest_pdpte0.hi;
+		break;
+	case VMCS_GUEST_PDPTE1:
+		*rsi = vmcs->guest_pdpte1.full;
+		break;
+	case VMCS_GUEST_PDPTE1_HI:
+		*rsi = vmcs->guest_pdpte1.hi;
+		break;
+	case VMCS_GUEST_PDPTE2:
+		*rsi = vmcs->guest_pdpte2.full;
+		break;
+	case VMCS_GUEST_PDPTE2_HI:
+		*rsi = vmcs->guest_pdpte2.hi;
+		break;
+	case VMCS_GUEST_PDPTE3:
+		*rsi = vmcs->guest_pdpte3.full;
+		break;
+	case VMCS_GUEST_PDPTE3_HI:
+		*rsi = vmcs->guest_pdpte3.hi;
+		break;
+	case VMCS_GUEST_IA32_BNDCFGS:
+		*rsi = vmcs->guest_bndcfgs.full;
+		break;
+	case VMCS_GUEST_IA32_BNDCFGS_HI:
+		*rsi = vmcs->guest_bndcfgs.hi;
+		break;
+	case VMCS_HOST_IA32_PAT:
+		*rsi = vmcs->host_pat.full;
+		break;
+	case VMCS_HOST_IA32_PAT_HI:
+		*rsi = vmcs->host_pat.hi;
+		break;
+	case VMCS_HOST_IA32_EFER:
+		*rsi = vmcs->host_efer.full;
+		break;
+	case VMCS_HOST_IA32_EFER_HI:
+		*rsi = vmcs->host_efer.hi;
+		break;
+	case VMCS_HOST_IA32_PERF_GBL_CTRL:
+		*rsi = vmcs->host_perf_global_ctrl.full;
+		break;
+	case VMCS_HOST_IA32_PERF_GBL_CTRL_HI:
+		*rsi = vmcs->host_perf_global_ctrl.hi;
+		break;
+	case VMCS_PINBASED_CTLS:
+		*(uint32_t *)*rsi = vmcs->pinbased_ctrls;
+		break;
+	case VMCS_PROCBASED_CTLS:
+		*(uint32_t *)rsi = vmcs->procbased_ctrls;
+		break;
+	case VMCS_EXCEPTION_BITMAP:
+		*(uint32_t *)rsi = vmcs->exception_bitmap;
+		break;
+	case VMCS_PF_ERROR_CODE_MASK:
+		*(uint32_t *)rsi = vmcs->pf_error_code_mask;
+		break;
+	case VMCS_PF_ERROR_CODE_MATCH:
+		*(uint32_t *)rsi = vmcs->pf_error_code_match;
+		break;
+	case VMCS_CR3_TARGET_COUNT:
+		*(uint32_t *)rsi = vmcs->cr3_target_count;
+		break;
+	case VMCS_EXIT_CTLS:
+		*(uint32_t *)rsi = vmcs->exit_ctrls;
+		break;
+	case VMCS_EXIT_MSR_STORE_COUNT:
+		*(uint32_t *)rsi = vmcs->exit_msr_store_count;
+		break;
+	case VMCS_EXIT_MSR_LOAD_COUNT:
+		*(uint32_t *)rsi = vmcs->exit_msr_load_count;
+		break;
+	case VMCS_ENTRY_CTLS:
+		*(uint32_t *)rsi = vmcs->entry_ctrls;
+		break;
+	case VMCS_ENTRY_MSR_LOAD_COUNT:
+		*(uint32_t *)rsi = vmcs->entry_msr_load_count;
+		break;
+	case VMCS_ENTRY_INTERRUPTION_INFO:
+		*(uint32_t *)rsi = vmcs->entry_interruption_info;
+		break;
+	case VMCS_ENTRY_EXCEPTION_ERROR_CODE:
+		*(uint32_t *)rsi = vmcs->entry_exception_error_code;
+		break;
+	case VMCS_ENTRY_INSTRUCTION_LENGTH:
+		*(uint32_t *)rsi = vmcs->entry_instruction_length;
+		break;
+	case VMCS_TPR_THRESHOLD:
+		*(uint32_t *)rsi = vmcs->tpr_threshold;
+		break;
+	case VMCS_PROCBASED2_CTLS:
+		*(uint32_t *)rsi = vmcs->tpr_threshold;
+		break;
+	case VMCS_PLE_GAP:
+		*(uint32_t *)rsi = vmcs->ple_gap;
+		break;
+	case VMCS_PLE_WINDOW:
+		*(uint32_t *)rsi = vmcs->ple_window;
+		break;
+	case VMCS_INSTRUCTION_ERROR:
+		*(uint32_t *)rsi = vmcs->instruction_error;
+		break;
+	case VMCS_EXIT_REASON:
+		*(uint32_t *)rsi = vmcs->exit_reason;
+		break;
+	case VMCS_EXIT_INTERRUPTION_INFO:
+		*(uint32_t *)rsi = vmcs->exit_interruption_info;
+		break;
+	case VMCS_EXIT_INTERRUPTION_ERR_CODE:
+		*(uint32_t *)rsi = vmcs->exit_interruption_error_code;
+		break;
+	case VMCS_IDT_VECTORING_INFO:
+		*(uint32_t *)rsi = vmcs->idt_vectoring_info;
+		break;
+	case VMCS_IDT_VECTORING_ERROR_CODE:
+		*(uint32_t *)rsi = vmcs->idt_vectoring_error_code;
+		break;
+	case VMCS_INSTRUCTION_LENGTH:
+		*(uint32_t *)rsi = vmcs->exit_instruction_length;
+		break;
+	case VMCS_EXIT_INSTRUCTION_INFO:
+		*(uint32_t *)rsi = vmcs->exit_instruction_information;
+		break;
+	case VMCS_GUEST_IA32_ES_LIMIT:
+		*(uint32_t *)rsi = vmcs->guest_es_limit;
+		break;
+	case VMCS_GUEST_IA32_CS_LIMIT:
+		*(uint32_t *)rsi = vmcs->guest_cs_limit;
+		break;
+	case VMCS_GUEST_IA32_SS_LIMIT:
+		*(uint32_t *)rsi = vmcs->guest_ss_limit;
+		break;
+	case VMCS_GUEST_IA32_DS_LIMIT:
+		*(uint32_t *)rsi = vmcs->guest_ds_limit;
+		break;
+	case VMCS_GUEST_IA32_FS_LIMIT:
+		*(uint32_t *)rsi = vmcs->guest_fs_limit;
+		break;
+	case VMCS_GUEST_IA32_GS_LIMIT:
+		*(uint32_t *)rsi = vmcs->guest_gs_limit;
+		break;
+	case VMCS_GUEST_IA32_LDTR_LIMIT:
+		*(uint32_t *)rsi = vmcs->guest_ldtr_limit;
+		break;
+	case VMCS_GUEST_IA32_TR_LIMIT:
+		*(uint32_t *)rsi = vmcs->guest_tr_limit;
+		break;
+	case VMCS_GUEST_IA32_GDTR_LIMIT:
+		*(uint32_t *)rsi = vmcs->guest_gdtr_limit;
+		break;
+	case VMCS_GUEST_IA32_IDTR_LIMIT:
+		*(uint32_t *)rsi = vmcs->guest_idtr_limit;
+		break;
+	case VMCS_GUEST_IA32_ES_AR:
+		*(uint32_t *)rsi = vmcs->guest_es_ar;
+		break;
+	case VMCS_GUEST_IA32_CS_AR:
+		*(uint32_t *)rsi = vmcs->guest_cs_ar;
+		break;
+	case VMCS_GUEST_IA32_SS_AR:
+		*(uint32_t *)rsi = vmcs->guest_ss_ar;
+		break;
+	case VMCS_GUEST_IA32_DS_AR:
+		*(uint32_t *)rsi = vmcs->guest_ds_ar;
+		break;
+	case VMCS_GUEST_IA32_FS_AR:
+		*(uint32_t *)rsi = vmcs->guest_fs_ar;
+		break;
+	case VMCS_GUEST_IA32_GS_AR:
+		*(uint32_t *)rsi = vmcs->guest_gs_ar;
+		break;
+	case VMCS_GUEST_IA32_LDTR_AR:
+		*(uint32_t *)rsi = vmcs->guest_ldtr_ar;
+		break;
+	case VMCS_GUEST_IA32_TR_AR:
+		*(uint32_t *)rsi = vmcs->guest_tr_ar;
+		break;
+	case VMCS_GUEST_INTERRUPTIBILITY_ST:
+		*(uint32_t *)rsi = vmcs->guest_interruptibility_state;
+		break;
+	case VMCS_GUEST_ACTIVITY_STATE:
+		*(uint32_t *)rsi = vmcs->guest_activity_state;
+		break;
+	case VMCS_GUEST_SMBASE:
+		*(uint32_t *)rsi = vmcs->guest_smbase;
+		break;
+	case VMCS_GUEST_IA32_SYSENTER_CS:
+		*(uint32_t *)rsi = vmcs->guest_sysenter_cs;
+		break;
+	case VMCS_VMX_PREEMPTION_TIMER_VAL:
+		*(uint32_t *)rsi = vmcs->vmx_preemption_timer_val;
+		break;
+	case VMCS_HOST_IA32_SYSENTER_CS:
+		*(uint32_t *)rsi = vmcs->host_sysenter_cs;
+		break;
+	case VMCS_CR0_MASK:
+		*rsi = vmcs->cr0_mask;
+		break;
+	case VMCS_CR4_MASK:
+		*rsi = vmcs->cr4_mask;
+		break;
+	case VMCS_CR0_READ_SHADOW:
+		*rsi = vmcs->cr0_read_shadow;
+		break;
+	case VMCS_CR4_READ_SHADOW:
+		*rsi = vmcs->cr4_read_shadow;
+		break;
+	case VMCS_CR3_TARGET_0:
+		*rsi = vmcs->cr3_target_0;
+		break;
+	case VMCS_CR3_TARGET_1:
+		*rsi = vmcs->cr3_target_1;
+		break;
+	case VMCS_CR3_TARGET_2:
+		*rsi = vmcs->cr3_target_2;
+		break;
+	case VMCS_CR3_TARGET_3:
+		*rsi = vmcs->cr3_target_3;
+		break;
+	case VMCS_GUEST_EXIT_QUALIFICATION:
+		*rsi = vmcs->exit_qualification;
+		break;
+	case VMCS_IO_RCX:
+		*rsi = vmcs->io_rcx;
+		break;
+	case VMCS_IO_RSI:
+		*rsi = vmcs->io_rsi;
+		break;
+	case VMCS_IO_RDI:
+		*rsi = vmcs->io_rdi;
+		break;
+	case VMCS_IO_RIP:
+		*rsi = vmcs->io_rip;
+		break;
+	case VMCS_GUEST_LINEAR_ADDRESS:
+		*rsi = vmcs->guest_linear_address;
+		break;
+	case VMCS_GUEST_IA32_CR0:
+		*rsi = vmcs->guest_cr0;
+		break;
+	case VMCS_GUEST_IA32_CR3:
+		*rsi = vmcs->guest_cr3;
+		break;
+	case VMCS_GUEST_IA32_CR4:
+		*rsi = vmcs->guest_cr4;
+		break;
+	case VMCS_GUEST_IA32_ES_BASE:
+		*rsi = vmcs->guest_es_base;
+		break;
+	case VMCS_GUEST_IA32_CS_BASE:
+		*rsi = vmcs->guest_cs_base;
+		break;
+	case VMCS_GUEST_IA32_SS_BASE:
+		*rsi = vmcs->guest_ss_base;
+		break;
+	case VMCS_GUEST_IA32_DS_BASE:
+		*rsi = vmcs->guest_ds_base;
+		break;
+	case VMCS_GUEST_IA32_FS_BASE:
+		*rsi = vmcs->guest_fs_base;
+		break;
+	case VMCS_GUEST_IA32_GS_BASE:
+		*rsi = vmcs->guest_gs_base;
+		break;
+	case VMCS_GUEST_IA32_LDTR_BASE:
+		*rsi = vmcs->guest_ldtr_base;
+		break;
+	case VMCS_GUEST_IA32_TR_BASE:
+		*rsi = vmcs->guest_tr_base;
+		break;
+	case VMCS_GUEST_IA32_GDTR_BASE:
+		*rsi = vmcs->guest_gdtr_base;
+		break;
+	case VMCS_GUEST_IA32_IDTR_BASE:
+		*rsi = vmcs->guest_idtr_base;
+		break;
+	case VMCS_GUEST_IA32_DR7:
+		*rsi = vmcs->guest_dr7;
+		break;
+	case VMCS_GUEST_IA32_RSP:
+		*rsi = vmcs->guest_rsp;
+		break;
+	case VMCS_GUEST_IA32_RIP:
+		*rsi = vmcs->guest_rip;
+		break;
+	case VMCS_GUEST_IA32_RFLAGS:
+		*rsi = vmcs->guest_rflags;
+		break;
+	case VMCS_GUEST_PENDING_DBG_EXC:
+		*rsi = vmcs->guest_pending_debug_exceptions;
+		break;
+	case VMCS_GUEST_IA32_SYSENTER_ESP:
+		*rsi = vmcs->guest_sysenter_esp;
+		break;
+	case VMCS_GUEST_IA32_SYSENTER_EIP:
+		*rsi = vmcs->guest_sysenter_eip;
+		break;
+	case VMCS_HOST_IA32_CR0:
+		*rsi = vmcs->host_cr0;
+		break;
+	case VMCS_HOST_IA32_CR3:
+		*rsi = vmcs->host_cr3;
+		break;
+	case VMCS_HOST_IA32_CR4:
+		*rsi = vmcs->host_cr4;
+		break;
+	case VMCS_HOST_IA32_FS_BASE:
+		*rsi = vmcs->host_fs_base;
+		break;
+	case VMCS_HOST_IA32_GS_BASE:
+		*rsi = vmcs->host_gs_base;
+		break;
+	case VMCS_HOST_IA32_TR_BASE:
+		*rsi = vmcs->host_tr_base;
+		break;
+	case VMCS_HOST_IA32_GDTR_BASE:
+		*rsi = vmcs->host_gdtr_base;
+		break;
+	case VMCS_HOST_IA32_IDTR_BASE:
+		*rsi = vmcs->host_idtr_base;
+		break;
+	case VMCS_HOST_IA32_SYSENTER_ESP:
+		*rsi = vmcs->host_sysenter_esp;
+		break;
+	case VMCS_HOST_IA32_SYSENTER_EIP:
+		*rsi = vmcs->host_sysenter_eip;
+		break;
+	case VMCS_HOST_IA32_RSP:
+		*rsi = vmcs->host_rsp;
+		break;
+	case VMCS_HOST_IA32_RIP:
+		*rsi = vmcs->host_rip;
+		break;
+	default:
+		DPRINTF("%s: invalid nested vmread exit @ 0x%llx, "
+		    "fieldid=0x%llx(INVALID), val=0x%llx\n", __func__,
+		    vcpu->vc_gueststate.vg_rip, rdi, *rsi);
+		VMfailValid(vcpu, VMCS_INSN_ERROR_INVALID_FIELD);
+		goto exit;
+	}
+
+	DPRINTF("%s: nested vmread exit @ 0x%llx, fieldid=0x%llx, "
+	    "val=0x%llx\n", __func__, vcpu->vc_gueststate.vg_rip,
+	    rdi, *rsi);
+
+	VMsucceed(vcpu);
+
+exit:
+	if (vmwrite(VMCS_GUEST_IA32_RFLAGS, vcpu->vc_gueststate.vg_rflags)) {
+		printf("%s: error saving guest rflags\n", __func__);
+		return (EINVAL);
+	}
+
+	return (0);
+}
+
+/*
+ * vmx_handle_vmwrite
+ *
+ * Handler for vmwrite instructions.
+ *
+ * Parameters:
+ *  vcpu: vcpu structure containing instruction info causing the exit
+ *
+ * Return value:
+ *  0: The operation was successful
+ *  EINVAL: An error occurred
+ */
+int
+vmx_handle_vmwrite(struct vcpu *vcpu)
+{
+	uint64_t insn_length;
+	uint64_t rdi, rsi;
+	struct vmcs *vmcs;
+
+	if (vmread(VMCS_INSTRUCTION_LENGTH, &insn_length)) {
+		printf("%s: can't obtain instruction length\n", __func__);
+		return (EINVAL);
+	}
+
+	/* We unconditionally emulate, so bump %rip now */
+	vcpu->vc_gueststate.vg_rip += insn_length;
+
+	/* XXX handle forms other than %rdi, %rsi */
+	rdi = vcpu->vc_gueststate.vg_rdi;
+	rsi = vcpu->vc_gueststate.vg_rsi;
+	vmcs = vcpu->vc_current_vmcs;
+
+	if (vcpu->vc_vmcs_vmx_mode == VMX_NESTING_MODE_NONE) {
+		VMfailInvalid(vcpu);
+		goto exit;
+	}
+
+	switch (rdi) {
+	case VMCS_GUEST_VPID:
+		vmcs->vpid = (uint16_t)rsi;
+		break;
+	case VMCS_POSTED_INT_NOTIF_VECTOR:
+		vmcs->pi_notification_vector = (uint16_t)rsi;
+		break;
+	case VMCS_EPTP_INDEX:
+		vmcs->eptp_index = (uint16_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_ES_SEL:
+		vmcs->guest_es_sel = (uint16_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_CS_SEL:
+		vmcs->guest_cs_sel = (uint16_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_SS_SEL:
+		vmcs->guest_ss_sel = (uint16_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_DS_SEL:
+		vmcs->guest_ds_sel = (uint16_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_FS_SEL:
+		vmcs->guest_fs_sel = (uint16_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_GS_SEL:
+		vmcs->guest_gs_sel = (uint16_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_LDTR_SEL:
+		vmcs->guest_ldtr_sel = (uint16_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_TR_SEL:
+		vmcs->guest_tr_sel = (uint16_t)rsi;
+		break;
+	case VMCS_GUEST_INTERRUPT_STATUS:
+		vmcs->guest_intr_status = (uint16_t)rsi;
+		break;
+	case VMCS_GUEST_PML_INDEX:
+		vmcs->pml_index = (uint16_t)rsi;
+		break;
+	case VMCS_HOST_IA32_ES_SEL:
+		vmcs->host_es_sel = (uint16_t)rsi;
+		break;
+	case VMCS_HOST_IA32_CS_SEL:
+		vmcs->host_cs_sel = (uint16_t)rsi;
+		break;
+	case VMCS_HOST_IA32_SS_SEL:
+		vmcs->host_ss_sel = (uint16_t)rsi;
+		break;
+	case VMCS_HOST_IA32_DS_SEL:
+		vmcs->host_ds_sel = (uint16_t)rsi;
+		break;
+	case VMCS_HOST_IA32_FS_SEL:
+		vmcs->host_fs_sel = (uint16_t)rsi;
+		break;
+	case VMCS_HOST_IA32_GS_SEL:
+		vmcs->host_gs_sel = (uint16_t)rsi;
+		break;
+	case VMCS_HOST_IA32_TR_SEL:
+		vmcs->host_tr_sel = (uint16_t)rsi;
+		break;
+	case VMCS_IO_BITMAP_A:
+		vmcs->io_bitmap_a.full = rsi;
+		break;
+	case VMCS_IO_BITMAP_A_HI:
+		vmcs->io_bitmap_a.hi = rsi;
+		break;
+	case VMCS_IO_BITMAP_B:
+		vmcs->io_bitmap_b.full = rsi;
+		break;
+	case VMCS_IO_BITMAP_B_HI:
+		vmcs->io_bitmap_b.hi = rsi;
+		break;
+	case VMCS_MSR_BITMAP_ADDRESS:
+		vmcs->msr_bitmap_addr.full = rsi;
+		break;
+	case VMCS_MSR_BITMAP_ADDRESS_HI:
+		vmcs->msr_bitmap_addr.hi = rsi;
+		break;
+	case VMCS_EXIT_STORE_MSR_ADDRESS:
+		vmcs->exit_msr_store_addr.full = rsi;
+		break;
+	case VMCS_EXIT_STORE_MSR_ADDRESS_HI:
+		vmcs->exit_msr_store_addr.hi = rsi;
+		break;
+	case VMCS_EXIT_LOAD_MSR_ADDRESS:
+		vmcs->exit_msr_load_addr.full = rsi;
+		break;
+	case VMCS_EXIT_LOAD_MSR_ADDRESS_HI:
+		vmcs->exit_msr_load_addr.hi = rsi;
+		break;
+	case VMCS_ENTRY_LOAD_MSR_ADDRESS:
+		vmcs->entry_msr_load_addr.full = rsi;
+		break;
+	case VMCS_ENTRY_LOAD_MSR_ADDRESS_HI:
+		vmcs->entry_msr_load_addr.hi = rsi;
+		break;
+	case VMCS_EXECUTIVE_VMCS_POINTER:
+		vmcs->executive_vmcs_pointer.full = rsi;
+		break;
+	case VMCS_EXECUTIVE_VMCS_POINTER_HI:
+		vmcs->executive_vmcs_pointer.hi = rsi;
+		break;
+	case VMCS_PML_ADDRESS:
+		vmcs->pml_address.full = rsi;
+		break;
+	case VMCS_PML_ADDRESS_HI:
+		vmcs->pml_address.hi = rsi;
+		break;
+	case VMCS_TSC_OFFSET:
+		vmcs->tsc_offset.full = rsi;
+		break;
+	case VMCS_TSC_OFFSET_HI:
+		vmcs->tsc_offset.hi = rsi;
+		break;
+	case VMCS_VIRTUAL_APIC_ADDRESS:
+		vmcs->virtual_apic_address.full = rsi;
+		break;
+	case VMCS_VIRTUAL_APIC_ADDRESS_HI:
+		vmcs->virtual_apic_address.hi = rsi;
+		break;
+	case VMCS_APIC_ACCESS_ADDRESS:
+		vmcs->apic_accees_address.full = rsi;
+		break;
+	case VMCS_APIC_ACCESS_ADDRESS_HI:
+		vmcs->apic_accees_address.hi = rsi;
+		break;
+	case VMCS_POSTED_INTERRUPT_DESC:
+		vmcs->posted_int_desc_address.full = rsi;
+		break;
+	case VMCS_POSTED_INTERRUPT_DESC_HI:
+		vmcs->posted_int_desc_address.hi = rsi;
+		break;
+	case VMCS_VM_FUNCTION_CONTROLS:
+		vmcs->vm_function_controls.full = rsi;
+		break;
+	case VMCS_VM_FUNCTION_CONTROLS_HI:
+		vmcs->vm_function_controls.hi = rsi;
+		break;
+	case VMCS_GUEST_IA32_EPTP:
+		vmcs->eptp.full = rsi;
+		break;
+	case VMCS_GUEST_IA32_EPTP_HI:
+		vmcs->eptp.hi = rsi;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_0:
+		vmcs->eoi_exit_bitmap_0.full = rsi;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_0_HI:
+		vmcs->eoi_exit_bitmap_0.hi = rsi;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_1:
+		vmcs->eoi_exit_bitmap_1.full = rsi;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_1_HI:
+		vmcs->eoi_exit_bitmap_1.hi = rsi;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_2:
+		vmcs->eoi_exit_bitmap_2.full = rsi;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_2_HI:
+		vmcs->eoi_exit_bitmap_2.hi = rsi;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_3:
+		vmcs->eoi_exit_bitmap_3.full = rsi;
+		break;
+	case VMCS_EOI_EXIT_BITMAP_3_HI:
+		vmcs->eoi_exit_bitmap_3.hi = rsi;
+		break;
+	case VMCS_EPTP_LIST_ADDRESS:
+		vmcs->eptp_list_address.full = rsi;
+		break;
+	case VMCS_EPTP_LIST_ADDRESS_HI:
+		vmcs->eptp_list_address.hi = rsi;
+		break;
+	case VMCS_VMREAD_BITMAP_ADDRESS:
+		vmcs->vmread_bitmap_address.full = rsi;
+		break;
+	case VMCS_VMREAD_BITMAP_ADDRESS_HI:
+		vmcs->vmread_bitmap_address.hi = rsi;
+		break;
+	case VMCS_VMWRITE_BITMAP_ADDRESS:
+		vmcs->vmwrite_bitmap_address.full = rsi;
+		break;
+	case VMCS_VMWRITE_BITMAP_ADDRESS_HI:
+		vmcs->vmwrite_bitmap_address.hi = rsi;
+		break;
+	case VMCS_VIRTUALIZATION_EXC_ADDRESS:
+		vmcs->virt_execption_info_address.full = rsi;
+		break;
+	case VMCS_VIRTUALIZATION_EXC_ADDRESS_HI:
+		vmcs->virt_execption_info_address.hi = rsi;
+		break;
+	case VMCS_XSS_EXITING_BITMAP:
+		vmcs->xss_exiting_bitmap.full = rsi;
+		break;
+	case VMCS_XSS_EXITING_BITMAP_HI:
+		vmcs->xss_exiting_bitmap.hi = rsi;
+		break;
+	case VMCS_TSC_MULTIPLIER:
+		vmcs->tsc_multiplier.full = rsi;
+		break;
+	case VMCS_TSC_MULTIPLIER_HI:
+		vmcs->tsc_multiplier.hi = rsi;
+		break;
+	case VMCS_GUEST_PHYSICAL_ADDRESS:
+		vmcs->guest_physical_address.full = rsi;
+		break;
+	case VMCS_GUEST_PHYSICAL_ADDRESS_HI:
+		vmcs->guest_physical_address.hi = rsi;
+		break;
+	case VMCS_LINK_POINTER:
+		vmcs->vmcs_link_pointer.full = rsi;
+		break;
+	case VMCS_LINK_POINTER_HI:
+		vmcs->vmcs_link_pointer.hi = rsi;
+		break;
+	case VMCS_GUEST_IA32_DEBUGCTL:
+		vmcs->guest_debugctl.full = rsi;
+		break;
+	case VMCS_GUEST_IA32_DEBUGCTL_HI:
+		vmcs->guest_debugctl.hi = rsi;
+		break;
+	case VMCS_GUEST_IA32_PAT:
+		vmcs->guest_pat.full = rsi;
+		break;
+	case VMCS_GUEST_IA32_PAT_HI:
+		vmcs->guest_pat.hi = rsi;
+		break;
+	case VMCS_GUEST_IA32_EFER:
+		vmcs->guest_efer.full = rsi;
+		break;
+	case VMCS_GUEST_IA32_EFER_HI:
+		vmcs->guest_efer.hi = rsi;
+		break;
+	case VMCS_GUEST_IA32_PERF_GBL_CTRL:
+		vmcs->guest_perf_global_ctrl.full = rsi;
+		break;
+	case VMCS_GUEST_IA32_PERF_GBL_CTRL_HI:
+		vmcs->guest_perf_global_ctrl.hi = rsi;
+		break;
+	case VMCS_GUEST_PDPTE0:
+		vmcs->guest_pdpte0.full = rsi;
+		break;
+	case VMCS_GUEST_PDPTE0_HI:
+		vmcs->guest_pdpte0.hi = rsi;
+		break;
+	case VMCS_GUEST_PDPTE1:
+		vmcs->guest_pdpte1.full = rsi;
+		break;
+	case VMCS_GUEST_PDPTE1_HI:
+		vmcs->guest_pdpte1.hi = rsi;
+		break;
+	case VMCS_GUEST_PDPTE2:
+		vmcs->guest_pdpte2.full = rsi;
+		break;
+	case VMCS_GUEST_PDPTE2_HI:
+		vmcs->guest_pdpte2.hi = rsi;
+		break;
+	case VMCS_GUEST_PDPTE3:
+		vmcs->guest_pdpte3.full = rsi;
+		break;
+	case VMCS_GUEST_PDPTE3_HI:
+		vmcs->guest_pdpte3.hi = rsi;
+		break;
+	case VMCS_GUEST_IA32_BNDCFGS:
+		vmcs->guest_bndcfgs.full = rsi;
+		break;
+	case VMCS_GUEST_IA32_BNDCFGS_HI:
+		vmcs->guest_bndcfgs.hi = rsi;
+		break;
+	case VMCS_HOST_IA32_PAT:
+		vmcs->host_pat.full = rsi;
+		break;
+	case VMCS_HOST_IA32_PAT_HI:
+		vmcs->host_pat.hi = rsi;
+		break;
+	case VMCS_HOST_IA32_EFER:
+		vmcs->host_efer.full = rsi;
+		break;
+	case VMCS_HOST_IA32_EFER_HI:
+		vmcs->host_efer.hi = rsi;
+		break;
+	case VMCS_HOST_IA32_PERF_GBL_CTRL:
+		vmcs->host_perf_global_ctrl.full = rsi;
+		break;
+	case VMCS_HOST_IA32_PERF_GBL_CTRL_HI:
+		vmcs->host_perf_global_ctrl.hi = rsi;
+		break;
+	case VMCS_PINBASED_CTLS:
+		DPRINTF("%s: set nested pinbased ctrls 0x%llx\n", __func__,
+		    (uint64_t)rsi);
+		vmcs->pinbased_ctrls = (uint32_t)rsi;
+		break;
+	case VMCS_PROCBASED_CTLS:
+		DPRINTF("%s: set nested procbased ctrls 0x%llx\n", __func__,
+		    (uint64_t)rsi);
+		vmcs->procbased_ctrls = (uint32_t)rsi;
+		break;
+	case VMCS_EXCEPTION_BITMAP:
+		vmcs->exception_bitmap = (uint32_t)rsi;
+		break;
+	case VMCS_PF_ERROR_CODE_MASK:
+		vmcs->pf_error_code_mask = (uint32_t)rsi;
+		break;
+	case VMCS_PF_ERROR_CODE_MATCH:
+		vmcs->pf_error_code_match = (uint32_t)rsi;
+		break;
+	case VMCS_CR3_TARGET_COUNT:
+		vmcs->cr3_target_count = (uint32_t)rsi;
+		break;
+	case VMCS_EXIT_CTLS:
+		DPRINTF("%s: set nested exit ctrls 0x%llx\n", __func__,
+		    (uint64_t)rsi);
+		vmcs->exit_ctrls = (uint32_t)rsi;
+		break;
+	case VMCS_EXIT_MSR_STORE_COUNT:
+		vmcs->exit_msr_store_count = (uint32_t)rsi;
+		break;
+	case VMCS_EXIT_MSR_LOAD_COUNT:
+		vmcs->exit_msr_load_count = (uint32_t)rsi;
+		break;
+	case VMCS_ENTRY_CTLS:
+		vmcs->entry_ctrls = (uint32_t)rsi;
+		break;
+	case VMCS_ENTRY_MSR_LOAD_COUNT:
+		vmcs->entry_msr_load_count = (uint32_t)rsi;
+		break;
+	case VMCS_ENTRY_INTERRUPTION_INFO:
+		vmcs->entry_interruption_info = (uint32_t)rsi;
+		break;
+	case VMCS_ENTRY_EXCEPTION_ERROR_CODE:
+		vmcs->entry_exception_error_code = (uint32_t)rsi;
+		break;
+	case VMCS_ENTRY_INSTRUCTION_LENGTH:
+		vmcs->entry_instruction_length = (uint32_t)rsi;
+		break;
+	case VMCS_TPR_THRESHOLD:
+		vmcs->tpr_threshold = (uint32_t)rsi;
+		break;
+	case VMCS_PROCBASED2_CTLS:
+		DPRINTF("%s: set nested procbased2 ctrls 0x%llx\n", __func__,
+		    (uint64_t)rsi);
+		vmcs->tpr_threshold = (uint32_t)rsi;
+		break;
+	case VMCS_PLE_GAP:
+		vmcs->ple_gap = (uint32_t)rsi;
+		break;
+	case VMCS_PLE_WINDOW:
+		vmcs->ple_window = (uint32_t)rsi;
+		break;
+	case VMCS_INSTRUCTION_ERROR:
+		vmcs->instruction_error = (uint32_t)rsi;
+		break;
+	case VMCS_EXIT_REASON:
+		vmcs->exit_reason = (uint32_t)rsi;
+		break;
+	case VMCS_EXIT_INTERRUPTION_INFO:
+		vmcs->exit_interruption_info = (uint32_t)rsi;
+		break;
+	case VMCS_EXIT_INTERRUPTION_ERR_CODE:
+		vmcs->exit_interruption_error_code = (uint32_t)rsi;
+		break;
+	case VMCS_IDT_VECTORING_INFO:
+		vmcs->idt_vectoring_info = (uint32_t)rsi;
+		break;
+	case VMCS_IDT_VECTORING_ERROR_CODE:
+		vmcs->idt_vectoring_error_code = (uint32_t)rsi;
+		break;
+	case VMCS_INSTRUCTION_LENGTH:
+		vmcs->exit_instruction_length = (uint32_t)rsi;
+		break;
+	case VMCS_EXIT_INSTRUCTION_INFO:
+		vmcs->exit_instruction_information = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_ES_LIMIT:
+		vmcs->guest_es_limit = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_CS_LIMIT:
+		vmcs->guest_cs_limit = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_SS_LIMIT:
+		vmcs->guest_ss_limit = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_DS_LIMIT:
+		vmcs->guest_ds_limit = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_FS_LIMIT:
+		vmcs->guest_fs_limit = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_GS_LIMIT:
+		vmcs->guest_gs_limit = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_LDTR_LIMIT:
+		vmcs->guest_ldtr_limit = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_TR_LIMIT:
+		vmcs->guest_tr_limit = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_GDTR_LIMIT:
+		vmcs->guest_gdtr_limit = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_IDTR_LIMIT:
+		vmcs->guest_idtr_limit = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_ES_AR:
+		vmcs->guest_es_ar = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_CS_AR:
+		vmcs->guest_cs_ar = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_SS_AR:
+		vmcs->guest_ss_ar = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_DS_AR:
+		vmcs->guest_ds_ar = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_FS_AR:
+		vmcs->guest_fs_ar = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_GS_AR:
+		vmcs->guest_gs_ar = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_LDTR_AR:
+		vmcs->guest_ldtr_ar = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_TR_AR:
+		vmcs->guest_tr_ar = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_INTERRUPTIBILITY_ST:
+		vmcs->guest_interruptibility_state = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_ACTIVITY_STATE:
+		vmcs->guest_activity_state = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_SMBASE:
+		vmcs->guest_smbase = (uint32_t)rsi;
+		break;
+	case VMCS_GUEST_IA32_SYSENTER_CS:
+		vmcs->guest_sysenter_cs = (uint32_t)rsi;
+		break;
+	case VMCS_VMX_PREEMPTION_TIMER_VAL:
+		vmcs->vmx_preemption_timer_val = (uint32_t)rsi;
+		break;
+	case VMCS_HOST_IA32_SYSENTER_CS:
+		vmcs->host_sysenter_cs = (uint32_t)rsi;
+		break;
+	case VMCS_CR0_MASK:
+		vmcs->cr0_mask = rsi;
+		break;
+	case VMCS_CR4_MASK:
+		vmcs->cr4_mask = rsi;
+		break;
+	case VMCS_CR0_READ_SHADOW:
+		vmcs->cr0_read_shadow = rsi;
+		break;
+	case VMCS_CR4_READ_SHADOW:
+		vmcs->cr4_read_shadow = rsi;
+		break;
+	case VMCS_CR3_TARGET_0:
+		vmcs->cr3_target_0 = rsi;
+		break;
+	case VMCS_CR3_TARGET_1:
+		vmcs->cr3_target_1 = rsi;
+		break;
+	case VMCS_CR3_TARGET_2:
+		vmcs->cr3_target_2 = rsi;
+		break;
+	case VMCS_CR3_TARGET_3:
+		vmcs->cr3_target_3 = rsi;
+		break;
+	case VMCS_GUEST_EXIT_QUALIFICATION:
+		vmcs->exit_qualification = rsi;
+		break;
+	case VMCS_IO_RCX:
+		vmcs->io_rcx = rsi;
+		break;
+	case VMCS_IO_RSI:
+		vmcs->io_rsi = rsi;
+		break;
+	case VMCS_IO_RDI:
+		vmcs->io_rdi = rsi;
+		break;
+	case VMCS_IO_RIP:
+		vmcs->io_rip = rsi;
+		break;
+	case VMCS_GUEST_LINEAR_ADDRESS:
+		vmcs->guest_linear_address = rsi;
+		break;
+	case VMCS_GUEST_IA32_CR0:
+		vmcs->guest_cr0 = rsi;
+		break;
+	case VMCS_GUEST_IA32_CR3:
+		vmcs->guest_cr3 = rsi;
+		break;
+	case VMCS_GUEST_IA32_CR4:
+		vmcs->guest_cr4 = rsi;
+		break;
+	case VMCS_GUEST_IA32_ES_BASE:
+		vmcs->guest_es_base = rsi;
+		break;
+	case VMCS_GUEST_IA32_CS_BASE:
+		vmcs->guest_cs_base = rsi;
+		break;
+	case VMCS_GUEST_IA32_SS_BASE:
+		vmcs->guest_ss_base = rsi;
+		break;
+	case VMCS_GUEST_IA32_DS_BASE:
+		vmcs->guest_ds_base = rsi;
+		break;
+	case VMCS_GUEST_IA32_FS_BASE:
+		vmcs->guest_fs_base = rsi;
+		break;
+	case VMCS_GUEST_IA32_GS_BASE:
+		vmcs->guest_gs_base = rsi;
+		break;
+	case VMCS_GUEST_IA32_LDTR_BASE:
+		vmcs->guest_ldtr_base = rsi;
+		break;
+	case VMCS_GUEST_IA32_TR_BASE:
+		vmcs->guest_tr_base = rsi;
+		break;
+	case VMCS_GUEST_IA32_GDTR_BASE:
+		vmcs->guest_gdtr_base = rsi;
+		break;
+	case VMCS_GUEST_IA32_IDTR_BASE:
+		vmcs->guest_idtr_base = rsi;
+		break;
+	case VMCS_GUEST_IA32_DR7:
+		vmcs->guest_dr7 = rsi;
+		break;
+	case VMCS_GUEST_IA32_RSP:
+		vmcs->guest_rsp = rsi;
+		break;
+	case VMCS_GUEST_IA32_RIP:
+		vmcs->guest_rip = rsi;
+		break;
+	case VMCS_GUEST_IA32_RFLAGS:
+		vmcs->guest_rflags = rsi;
+		break;
+	case VMCS_GUEST_PENDING_DBG_EXC:
+		vmcs->guest_pending_debug_exceptions = rsi;
+		break;
+	case VMCS_GUEST_IA32_SYSENTER_ESP:
+		vmcs->guest_sysenter_esp = rsi;
+		break;
+	case VMCS_GUEST_IA32_SYSENTER_EIP:
+		vmcs->guest_sysenter_eip = rsi;
+		break;
+	case VMCS_HOST_IA32_CR0:
+		vmcs->host_cr0 = rsi;
+		break;
+	case VMCS_HOST_IA32_CR3:
+		vmcs->host_cr3 = rsi;
+		break;
+	case VMCS_HOST_IA32_CR4:
+		vmcs->host_cr4 = rsi;
+		break;
+	case VMCS_HOST_IA32_FS_BASE:
+		vmcs->host_fs_base = rsi;
+		break;
+	case VMCS_HOST_IA32_GS_BASE:
+		vmcs->host_gs_base = rsi;
+		break;
+	case VMCS_HOST_IA32_TR_BASE:
+		vmcs->host_tr_base = rsi;
+		break;
+	case VMCS_HOST_IA32_GDTR_BASE:
+		vmcs->host_gdtr_base = rsi;
+		break;
+	case VMCS_HOST_IA32_IDTR_BASE:
+		vmcs->host_idtr_base = rsi;
+		break;
+	case VMCS_HOST_IA32_SYSENTER_ESP:
+		vmcs->host_sysenter_esp = rsi;
+		break;
+	case VMCS_HOST_IA32_SYSENTER_EIP:
+		vmcs->host_sysenter_eip = rsi;
+		break;
+	case VMCS_HOST_IA32_RSP:
+		vmcs->host_rsp = rsi;
+		break;
+	case VMCS_HOST_IA32_RIP:
+		vmcs->host_rip = rsi;
+		break;
+	default:
+		DPRINTF("%s: invalid nested vmwrite exit @ 0x%llx, "
+		    "fieldid=0x%llx(INVALID), val=0x%llx\n", __func__,
+		    vcpu->vc_gueststate.vg_rip, rdi, rsi);
+		VMfailValid(vcpu, VMCS_INSN_ERROR_INVALID_FIELD);
+		goto exit;
+	}
+
+	DPRINTF("%s: nested vmwrite exit @ 0x%llx, fieldid=0x%llx, "
+	    "val=0x%llx\n", __func__, vcpu->vc_gueststate.vg_rip,
+	    rdi, rsi);
+
+	VMsucceed(vcpu);
+
+exit:
+	if (vmwrite(VMCS_GUEST_IA32_RFLAGS, vcpu->vc_gueststate.vg_rflags)) {
+		printf("%s: error saving guest rflags\n", __func__);
+		return (EINVAL);
+	}
+
+	return (0);
+}
+
+/*
+ * vmx_handle_vmxoff
+ *
+ * Handler for vmxoff instructions.
+ *
+ * Parameters:
+ *  vcpu: vcpu structure containing instruction info causing the exit
+ *
+ * Return value:
+ *  0: The operation was successful
+ *  EINVAL: An error occurred
+ */
+int
+vmx_handle_vmxoff(struct vcpu *vcpu)
+{
+	uint64_t insn_length;
+
+	if (vmread(VMCS_INSTRUCTION_LENGTH, &insn_length)) {
+		printf("%s: can't obtain instruction length\n", __func__);
+		return (EINVAL);
+	}
+
+	/* All VMXOFF instructions are 0x0F 0x01 0xC4 */
+	KASSERT(insn_length == 3);
+
+	DPRINTF("%s: nested vmxoff exit @ 0x%llx\n",
+	    __func__, vcpu->vc_gueststate.vg_rip);
+
+	if (vcpu->vc_vmcs_vmx_mode == VMM_MODE_VMX ||
+	    vcpu->vc_vmcs_vmx_mode == VMM_MODE_EPT) {
+		vcpu->vc_vmcs_vmx_mode = VMX_NESTING_MODE_NONE;
+		vcpu->vc_vmxon_region_pa = 0;
+		vcpu->vc_current_vmcs_pa = 0;
+	} else {
+		DPRINTF("%s: vmxoff while not in VMX mode\n", __func__);
+		return vmm_inject_ud(vcpu);
+	}
+
+	vcpu->vc_gueststate.vg_rip += insn_length;
+	VMsucceed(vcpu);
+
+	if (vmwrite(VMCS_GUEST_IA32_RFLAGS, vcpu->vc_gueststate.vg_rflags)) {
+		printf("%s: error saving guest rflags\n", __func__);
+		return (EINVAL);
+	}
+
+	return (0);
+}
+
+/*
+ * vmx_handle_vmxon
+ *
+ * Handler for vmxon instructions.
+ *
+ * Parameters:
+ *  vcpu: vcpu structure containing instruction info causing the exit
+ *
+ * Return value:
+ *  0: The operation was successful
+ *  EINVAL: An error occurred
+ */
+int
+vmx_handle_vmxon(struct vcpu *vcpu)
+{
+	uint64_t insn_length, rdi, cr4, tmp;
+	paddr_t hpa;
+
+	if (vmread(VMCS_INSTRUCTION_LENGTH, &insn_length)) {
+		printf("%s: can't obtain instruction length\n", __func__);
+		return (EINVAL);
+	}
+
+	/* XXX handle not %rdi arg */
+	rdi = vcpu->vc_gueststate.vg_rdi;
+
+	if (vmread(VMCS_GUEST_IA32_CR4, &cr4)) {
+		printf("%s: can't obtain guest cr4\n", __func__);
+		return (EINVAL);
+	}
+
+	if (!(cr4 & CR4_VMXE))
+		return vmm_inject_ud(vcpu);
+
+	if (vcpu->vc_vmcs_vmx_mode == VMCS_VMX_MODE_NONE) {
+		if (!(vcpu->vc_ia32_feature_control_msr &
+		    IA32_FEATURE_CONTROL_LOCK))
+			return vmm_inject_gp(vcpu);
+
+		if (!(vcpu->vc_ia32_feature_control_msr &
+		    IA32_FEATURE_CONTROL_VMX_EN))
+			return vmm_inject_gp(vcpu);
+	}
+
+	/* XXX ensure rdi <= phys range of this host CPU */
+	/* XXX ensure region contains proper revision code */
+	DPRINTF("%s: nested vmxon exit, rdi=0x%llx\n", __func__, rdi);
+	if (vmm_translate_gva(vcpu, rdi, &tmp, PROT_READ)) {
+		return (EINVAL);
+	}
+
+	if (!pmap_extract(vcpu->vc_parent->vm_map->pmap, tmp, &hpa)) {
+		return (EINVAL);
+	}
+
+	vcpu->vc_vmxon_region_pa = *((uint64_t *)PMAP_DIRECT_MAP((hpa | (tmp & 0xFFF))));
+
+	vcpu->vc_gueststate.vg_rip += insn_length;
+	VMsucceed(vcpu);
+
+	/* log the access */
+	DPRINTF("%s: nested vmxon exit @ 0x%llx "
+	    "guest %%rdi 0x%llx, guest *%%rdi (PA) 0x%llx\n",
+	    __func__, vcpu->vc_gueststate.vg_rip, rdi,
+	    vcpu->vc_vmxon_region_pa);
+
+	vcpu->vc_vmcs_vmx_mode = VMX_NESTING_MODE_ROOT;
+
+	if (vmwrite(VMCS_GUEST_IA32_RFLAGS, vcpu->vc_gueststate.vg_rflags)) {
+		printf("%s: error saving guest rflags\n", __func__);
+		return (EINVAL);
+	}
+
+	return (0);
 }
 
 /*
