@@ -1174,13 +1174,18 @@ struct vcpu {
 	uint64_t vc_vmx_basic;
 	uint64_t vc_vmx_entry_ctls;
 	uint64_t vc_vmx_true_entry_ctls;
+	uint64_t vc_vmx_current_entry_ctls;
 	uint64_t vc_vmx_exit_ctls;
 	uint64_t vc_vmx_true_exit_ctls;
+	uint64_t vc_vmx_current_exit_ctls;
 	uint64_t vc_vmx_pinbased_ctls;
 	uint64_t vc_vmx_true_pinbased_ctls;
+	uint64_t vc_vmx_current_pinbased_ctls;
 	uint64_t vc_vmx_procbased_ctls;
 	uint64_t vc_vmx_true_procbased_ctls;
+	uint64_t vc_vmx_current_procbased_ctls;
 	uint64_t vc_vmx_procbased2_ctls;
+	uint64_t vc_vmx_current_procbased2_ctls;
 	vaddr_t vc_vmx_msr_exit_save_va;
 	paddr_t vc_vmx_msr_exit_save_pa;
 	vaddr_t vc_vmx_msr_exit_load_va;
@@ -1190,6 +1195,8 @@ struct vcpu {
 	uint8_t vc_vmx_vpid_enabled;
 	uint64_t vc_vmx_cr0_fixed1;
 	uint64_t vc_vmx_cr0_fixed0;
+	uint64_t vc_vmx_cr4_fixed1;
+	uint64_t vc_vmx_cr4_fixed0;
 
 	/* Nesting */
 	uint8_t	vc_vmcs_vmx_mode;
@@ -1198,6 +1205,9 @@ struct vcpu {
 	uint64_t vc_ia32_feature_control_msr;
 	uint64_t vc_vmx_cr3_targets[VMX_MAX_CR3_TARGETS];
 	struct vmcs *vc_current_vmcs;
+	/* VMCS / VMCB pointer */
+	vaddr_t vc_nonroot_control_va;
+	uint64_t vc_nonroot_control_pa;
 
 	/* SVM only */
 	vaddr_t vc_svm_hsa_va;

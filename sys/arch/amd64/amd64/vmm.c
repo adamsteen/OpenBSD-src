@@ -182,6 +182,7 @@ int vmx_handle_vmwrite(struct vcpu *);
 int vmx_handle_vmread(struct vcpu *);
 int vmx_handle_vmlaunch(struct vcpu *);
 int vmx_handle_vmresume(struct vcpu *);
+int vmx_handle_vmlaunch_vmresume(struct vcpu *, int);
 int vmm_inject_gp(struct vcpu *);
 int vmm_inject_ud(struct vcpu *);
 int vmm_inject_db(struct vcpu *);
@@ -2750,6 +2751,7 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 		ret = EINVAL;
 		goto exit;
 	}
+	vcpu->vc_vmx_current_pinbased_ctls = pinbased;
 
 	/*
 	 * Procbased ctrls
@@ -2803,6 +2805,7 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 		ret = EINVAL;
 		goto exit;
 	}
+	vcpu->vc_vmx_current_procbased_ctls = procbased;
 
 	/*
 	 * Secondary Procbased ctrls
@@ -2861,6 +2864,7 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 		ret = EINVAL;
 		goto exit;
 	}
+	vcpu->vc_vmx_current_procbased2_ctls = procbased2;
 
 	/*
 	 * Exit ctrls
@@ -2894,6 +2898,7 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 		ret = EINVAL;
 		goto exit;
 	}
+	vcpu->vc_vmx_current_exit_ctls = exit;
 
 	/*
 	 * Entry ctrls
@@ -2933,6 +2938,7 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 		ret = EINVAL;
 		goto exit;
 	}
+	vcpu->vc_vmx_current_entry_ctls = entry;
 
 	if (vmm_softc->mode == VMM_MODE_EPT) {
 		eptp = vcpu->vc_parent->vm_map->pmap->pm_pdirpa;
@@ -3047,6 +3053,8 @@ vcpu_reset_regs_vmx(struct vcpu *vcpu, struct vcpu_reg_state *vrs)
 		ret = EINVAL;
 		goto exit;
 	}
+	vcpu->vc_vmx_cr4_fixed1 = want1;
+	vcpu->vc_vmx_cr4_fixed0 = want0;
 
 	cr3 = vrs->vrs_crs[VCPU_REGS_CR3];
 
@@ -3257,7 +3265,7 @@ exit:
 int
 vcpu_init_vmx(struct vcpu *vcpu)
 {
-	struct vmcs *vmcs;
+	struct vmcs *vmcs, *vmcs02;
 	uint32_t cr0, cr4;
 	int ret;
 
@@ -3341,8 +3349,27 @@ vcpu_init_vmx(struct vcpu *vcpu)
 		goto exit;
 	}
 
+	/* Allocate VMCS02 VA */
+	vcpu->vc_nonroot_control_va = (vaddr_t)km_alloc(PAGE_SIZE, &kv_page, &kp_zero,
+	    &kd_waitok);
+
+	if (!vcpu->vc_nonroot_control_va) {
+		ret = ENOMEM;
+		goto exit;
+	}
+
+	/* Compute VMCS02 PA */
+	if (!pmap_extract(pmap_kernel(), vcpu->vc_nonroot_control_va,
+	    (paddr_t *)&vcpu->vc_nonroot_control_pa)) {
+		ret = ENOMEM;
+		goto exit;
+	}
+
 	vmcs = (struct vmcs *)vcpu->vc_control_va;
 	vmcs->vmcs_revision = curcpu()->ci_vmm_cap.vcc_vmx.vmx_vmxon_revision;
+
+	vmcs02 = (struct vmcs *)vcpu->vc_nonroot_control_va;
+	vmcs02->vmcs_revision = curcpu()->ci_vmm_cap.vcc_vmx.vmx_vmxon_revision;
 
 	/*
 	 * Load the VMCS onto this PCPU so we can write registers
@@ -6369,6 +6396,10 @@ vmx_handle_rdmsr(struct vcpu *vcpu)
 	 * XXX -
 	 * all these VMX MSRs need to consider what the host can do
 	 */
+	case MSR_IA32_FEATURE_CONTROL:
+		*rax = 0; // enable VMX
+		*rdx = 0;
+		break;
 	case IA32_VMX_BASIC:
 		/*
 		 * Bits 31:0  - Revision ID
@@ -6618,7 +6649,7 @@ vmx_handle_rdmsr(struct vcpu *vcpu)
 		 * Bit 42 - INVVPID all ctx supported
 		 * Bit 43 - INVVPID single ctx with globals supported
 		 */
-		*rax = (IA32_EPT_VPID_CAP_XO |
+		*rax = (IA32_EPT_VPID_CAP_XO_TRANSLATIONS |
 		    IA32_EPT_VPID_CAP_PAGE_WALK_4 |
 		    IA32_EPT_VPID_CAP_WB |
 		    IA32_EPT_VPID_CAP_2MB |
@@ -7767,6 +7798,9 @@ vmx_handle_vmlaunch(struct vcpu *vcpu)
 		return (EINVAL);
 	}
 
+	/* We unconditionally emulate, so bump %rip now */
+	vcpu->vc_gueststate.vg_rip += insn_length;
+
 	/* All VMLAUNCH instructions are 0x0F 0x01 0xC2 */
 	KASSERT(insn_length == 3);
 
@@ -7777,10 +7811,7 @@ vmx_handle_vmlaunch(struct vcpu *vcpu)
 	    __func__, vcpu->vc_gueststate.vg_rip,
 	    *rax);
 
-	vcpu->vc_gueststate.vg_rip += insn_length;
-
-//	return (0);
-	return (EINVAL);
+	return vmx_handle_vmlaunch_vmresume(vcpu, 0);
 }
 
 /*
@@ -7818,8 +7849,615 @@ vmx_handle_vmresume(struct vcpu *vcpu)
 
 	vcpu->vc_gueststate.vg_rip += insn_length;
 
-//	return (0);
-	return (EINVAL);
+	return vmx_handle_vmlaunch_vmresume(vcpu, 1);
+}
+
+/*
+ * vmx_handle_vmlaunch_vmresume
+ *
+ * do the heavy lifting for vmlaunch and vmresume instructions.
+ *
+ * Parameters:
+ *  vcpu: vcpu structure containing instruction info causing the exit
+ *  resume: 
+ *
+ * Return value:
+ *  0: The operation was successful
+ *  EINVAL: An error occurred
+ */
+int
+vmx_handle_vmlaunch_vmresume(struct vcpu *vcpu, int resume)
+{
+	struct vmcs *vmcs12;
+	struct vmx_invvpid_descriptor vid;
+	uint64_t cr0, cr3, cr4, msr, efer;
+	uint32_t procbased, procbased2, entry;
+
+	// XXX check error handling
+
+	printf("%s: start vmlaunch/vmresume!!\n", __func__);
+	/*
+	 * Clear VMCS02 it may have been used by a different nested vm
+	 */
+	if (vmclear(&vcpu->vc_nonroot_control_pa)) {
+		DPRINTF("%s: vmclear failed\n", __func__);
+		return EINVAL;
+	}
+
+	/*
+	 * Load the VMCS02 onto this PCPU so we can write registers
+	 */
+	if (vmptrld(&vcpu->vc_nonroot_control_pa)) {
+		DPRINTF("%s: vmptrld failed\n", __func__);
+		return EINVAL;
+	}
+	
+	vmcs12 = vcpu->vc_current_vmcs;
+	// XXX is this correct? using the current vcpu's vpid
+	if (vmwrite(VMCS_GUEST_VPID, vcpu->vc_vpid)) {
+		DPRINTF("%s: error writing Guest vpid\n", __func__);
+		return EINVAL;
+	}
+	if (vcpu->vc_vmx_vpid_enabled) {
+		/* Invalidate TLB mappings */
+		vid.vid_vpid = vcpu->vc_vpid;
+		vid.vid_addr = 0;
+		invvpid(IA32_VMX_INVVPID_SINGLE_CTX_GLB, &vid);
+	}
+	//vmwrite(VMCS_POSTED_INT_NOTIF_VECTOR, 0);
+	//vmwrite(VMCS_EPTP_INDEX, 0);
+
+	if (vmwrite(VMCS_GUEST_IA32_ES_SEL, vmcs12->guest_es_sel)) {
+		DPRINTF("%s: error writing Guest ES selector\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_CS_SEL, vmcs12->guest_cs_sel)) {
+		DPRINTF("%s: error writing Guest CS selector\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_SS_SEL, vmcs12->guest_ss_sel)) {
+		DPRINTF("%s: error writing Guest SS selector\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_DS_SEL, vmcs12->guest_ds_sel)) {
+		DPRINTF("%s: error writing Guest DS selector\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_FS_SEL, vmcs12->guest_fs_sel)) {
+		DPRINTF("%s: error writing Guest FS selector\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_GS_SEL, vmcs12->guest_gs_sel)) {
+		DPRINTF("%s: error writing Guest GS selector\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_LDTR_SEL, vmcs12->guest_ldtr_sel)) {
+		DPRINTF("%s: error writing Guest LDTR selector\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_TR_SEL, vmcs12->guest_tr_sel)) {
+		DPRINTF("%s: error writing Guest TR selector\n", __func__);
+		return EINVAL;
+	}
+
+	//vmwrite(VMCS_GUEST_INTERRUPT_STATUS, 0);
+	//vmwrite(VMCS_GUEST_PML_INDEX, 0);
+
+	if (vmwrite(VMCS_HOST_IA32_ES_SEL, GSEL(GDATA_SEL, SEL_KPL))) {
+		DPRINTF("%s: error writing host ES selector\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_HOST_IA32_CS_SEL, GSEL(GCODE_SEL, SEL_KPL))) {
+		DPRINTF("%s: error writing host CS selector\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_HOST_IA32_SS_SEL, GSEL(GDATA_SEL, SEL_KPL))) {
+		DPRINTF("%s: error writing host SS selector\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_HOST_IA32_DS_SEL, GSEL(GDATA_SEL, SEL_KPL))) {
+		DPRINTF("%s: error writing host DS selector\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_HOST_IA32_FS_SEL, GSEL(GDATA_SEL, SEL_KPL))) {
+		DPRINTF("%s: error writing host FS selector\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_HOST_IA32_GS_SEL, GSEL(GDATA_SEL, SEL_KPL))) {
+		DPRINTF("%s: error writing host GS selector\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_HOST_IA32_TR_SEL, GSYSSEL(GPROC0_SEL, SEL_KPL))) {
+		DPRINTF("%s: error writing host TR selector\n", __func__);
+		return EINVAL;
+	}
+
+	//vmwrite(VMCS_IO_BITMAP_A, 0);
+	//vmwrite(VMCS_IO_BITMAP_A_HI, 0);
+	//vmwrite(VMCS_IO_BITMAP_B, 0);
+	//vmwrite(VMCS_IO_BITMAP_B_HI, 0);
+	//vmwrite(VMCS_MSR_BITMAP_ADDRESS, 0);
+	//vmwrite(VMCS_MSR_BITMAP_ADDRESS_HI, 0);
+	//vmwrite(VMCS_EXIT_STORE_MSR_ADDRESS, 0);
+	//vmwrite(VMCS_EXIT_STORE_MSR_ADDRESS_HI, 0);
+	//vmwrite(VMCS_EXIT_LOAD_MSR_ADDRESS, 0);
+	//vmwrite(VMCS_EXIT_LOAD_MSR_ADDRESS_HI, 0);
+	//vmwrite(VMCS_ENTRY_LOAD_MSR_ADDRESS, 0);
+	//vmwrite(VMCS_ENTRY_LOAD_MSR_ADDRESS_HI, 0);
+	//vmwrite(VMCS_EXECUTIVE_VMCS_POINTER, 0);
+	//vmwrite(VMCS_EXECUTIVE_VMCS_POINTER_HI, 0);
+	//vmwrite(VMCS_PML_ADDRESS, 0);
+	//vmwrite(VMCS_PML_ADDRESS_HI, 0);
+	//vmwrite(VMCS_TSC_OFFSET	, 0);
+	//vmwrite(VMCS_TSC_OFFSET_HI, 0);
+	//vmwrite(VMCS_VIRTUAL_APIC_ADDRESS, 0);
+	//vmwrite(VMCS_VIRTUAL_APIC_ADDRESS_HI, 0);
+	//vmwrite(VMCS_APIC_ACCESS_ADDRESS, 0);
+	//vmwrite(VMCS_APIC_ACCESS_ADDRESS_HI, 0);
+	//vmwrite(VMCS_POSTED_INTERRUPT_DESC, 0);
+	//vmwrite(VMCS_POSTED_INTERRUPT_DESC_HI, 0);
+	//vmwrite(VMCS_VM_FUNCTION_CONTROLS, 0);
+	//vmwrite(VMCS_VM_FUNCTION_CONTROLS_HI, 0);
+	//vmwrite(VMCS_GUEST_IA32_EPTP, 0);
+	//vmwrite(VMCS_GUEST_IA32_EPTP_HI, 0);
+	//vmwrite(VMCS_EOI_EXIT_BITMAP_0, 0);
+	//vmwrite(VMCS_EOI_EXIT_BITMAP_0_HI, 0);
+	//vmwrite(VMCS_EOI_EXIT_BITMAP_1, 0);
+	//vmwrite(VMCS_EOI_EXIT_BITMAP_1_HI, 0);
+	//vmwrite(VMCS_EOI_EXIT_BITMAP_2, 0);
+	//vmwrite(VMCS_EOI_EXIT_BITMAP_2_HI, 0);
+	//vmwrite(VMCS_EOI_EXIT_BITMAP_3, 0);
+	//vmwrite(VMCS_EOI_EXIT_BITMAP_3_HI, 0);
+	//vmwrite(VMCS_EPTP_LIST_ADDRESS, 0);
+	//vmwrite(VMCS_EPTP_LIST_ADDRESS_HI, 0);
+	//vmwrite(VMCS_VMREAD_BITMAP_ADDRESS, 0);
+	//vmwrite(VMCS_VMREAD_BITMAP_ADDRESS_HI, 0);
+	//vmwrite(VMCS_VMWRITE_BITMAP_ADDRESS, 0);
+	//vmwrite(VMCS_VMWRITE_BITMAP_ADDRESS_HI, 0);
+	//vmwrite(VMCS_VIRTUALIZATION_EXC_ADDRESS, 0);
+	//vmwrite(VMCS_VIRTUALIZATION_EXC_ADDRESS_HI, 0);
+	//vmwrite(VMCS_XSS_EXITING_BITMAP, 0);
+	//vmwrite(VMCS_XSS_EXITING_BITMAP_HI, 0);
+	//vmwrite(VMCS_ENCLS_EXITING_BITMAP, 0);
+	//vmwrite(VMCS_ENCLS_EXITING_BITMAP_HI, 0);
+	//vmwrite(VMCS_TSC_MULTIPLIER, 0);
+	//vmwrite(VMCS_TSC_MULTIPLIER_HI, 0);
+
+	//vmwrite(VMCS_GUEST_PHYSICAL_ADDRESS, 0);
+	//vmwrite(VMCS_GUEST_PHYSICAL_ADDRESS_HI, 0);
+
+	// XXX unsure of this.
+	if (vmwrite(VMCS_LINK_POINTER, 0xFFFFFFFFFFFFFFFF)) {
+		DPRINTF("%s: error writing VMCS link pointer\n", __func__);
+		return EINVAL;
+	}
+
+	//vmwrite(VMCS_LINK_POINTER_HI, 0);
+
+	if (vmwrite(VMCS_GUEST_IA32_DEBUGCTL, vmcs12->guest_debugctl.full)) {
+		DPRINTF("%s: error writing Guest DEBUGCTL\n", __func__);
+		return EINVAL;
+	}
+	//vmwrite(VMCS_GUEST_IA32_DEBUGCTL_HI, 0);
+	//vmwrite(VMCS_GUEST_IA32_PAT, 0); // XXX handled after entry controls
+	//vmwrite(VMCS_GUEST_IA32_PAT_HI, 0);
+	//vmwrite(VMCS_GUEST_IA32_EFER, 0);
+	//vmwrite(VMCS_GUEST_IA32_EFER_HI, 0);
+	//vmwrite(VMCS_GUEST_IA32_PERF_GBL_CTRL, 0);
+	//vmwrite(VMCS_GUEST_IA32_PERF_GBL_CTRL_HI, 0);
+	//vmwrite(VMCS_GUEST_PDPTE0, 0);
+	//vmwrite(VMCS_GUEST_PDPTE0_HI, 0);
+	//vmwrite(VMCS_GUEST_PDPTE1, 0);
+	//vmwrite(VMCS_GUEST_PDPTE1_HI, 0);
+	//vmwrite(VMCS_GUEST_PDPTE2, 0);
+	//vmwrite(VMCS_GUEST_PDPTE2_HI, 0);
+	//vmwrite(VMCS_GUEST_PDPTE3, 0);
+	//vmwrite(VMCS_GUEST_PDPTE3_HI, 0);
+	//vmwrite(VMCS_GUEST_IA32_BNDCFGS, 0);
+	//vmwrite(VMCS_GUEST_IA32_BNDCFGS_HI, 0);
+
+	if(vcpu->vc_vmx_exit_ctls & IA32_VMX_LOAD_IA32_PAT_ON_EXIT) {
+		msr = rdmsr(MSR_CR_PAT);
+		if (vmwrite(VMCS_HOST_IA32_PAT, msr)) {
+			DPRINTF("%s: error writing Host PAT\n", __func__);
+			return EINVAL;
+		}
+	}
+	//vmwrite(VMCS_HOST_IA32_PAT_HI, 0);
+	//vmwrite(VMCS_HOST_IA32_EFER, 0);
+	//vmwrite(VMCS_HOST_IA32_EFER_HI, 0);
+	//vmwrite(VMCS_HOST_IA32_PERF_GBL_CTRL, 0);
+	//vmwrite(VMCS_HOST_IA32_PERF_GBL_CTRL_HI	, 0);
+
+	if(vmwrite(VMCS_PINBASED_CTLS, vcpu->vc_vmx_current_pinbased_ctls | vmcs12->pinbased_ctrls)) {
+		DPRINTF("%s: error writing Pinbased Ctrls\n", __func__);
+		return EINVAL;
+	}
+	
+	procbased = vcpu->vc_vmx_current_procbased_ctls;
+	procbased &= ~IA32_VMX_USE_TPR_SHADOW;
+	procbased |= IA32_VMX_UNCONDITIONAL_IO_EXITING;
+	procbased &= ~IA32_VMX_USE_IO_BITMAPS;
+	procbased &= ~IA32_VMX_USE_MSR_BITMAPS;
+	if (vmwrite(VMCS_PROCBASED_CTLS, procbased)) {
+		DPRINTF("%s: error writing Procbased Ctrls\n", __func__);
+		return EINVAL;
+	}
+	//vmwrite(VMCS_EXCEPTION_BITMAP, 0);
+	//vmwrite(VMCS_PF_ERROR_CODE_MASK, 0);
+	//vmwrite(VMCS_PF_ERROR_CODE_MATCH, 0);
+	//vmwrite(VMCS_CR3_TARGET_COUNT, 0);
+	
+	if (vmwrite(VMCS_EXIT_CTLS, vcpu->vc_vmx_current_exit_ctls | vmcs12->exit_ctrls)) {
+		DPRINTF("%s: error writing Exit Ctrls\n", __func__);
+		return EINVAL;
+	}
+
+	//vmwrite(VMCS_EXIT_MSR_STORE_COUNT, 0);
+	//vmwrite(VMCS_EXIT_MSR_LOAD_COUNT, 0);
+	entry = vcpu->vc_vmx_current_entry_ctls & ~IA32_VMX_IA32E_MODE_GUEST;
+	entry |= vmcs12->entry_ctrls;
+
+	if (entry & IA32_VMX_LOAD_IA32_PAT_ON_ENTRY)
+		efer = vmcs12->guest_efer.full;
+	if (entry & IA32_VMX_IA32E_MODE_GUEST)
+		efer |= (EFER_LMA | EFER_LME);
+	else
+		efer &= ~(EFER_LMA | EFER_LME);
+
+	if (efer & EFER_LMA) {
+		entry |= IA32_VMX_IA32E_MODE_GUEST;
+	} else {
+		entry &= ~IA32_VMX_IA32E_MODE_GUEST;
+	}
+	// XXX MSRS?
+
+	if (vmwrite(VMCS_ENTRY_CTLS, entry)) {
+		DPRINTF("%s: error writing Entry Ctrls\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmcs12->entry_ctrls & IA32_VMX_LOAD_IA32_PAT_ON_ENTRY) {
+		if (vmwrite(VMCS_GUEST_IA32_PAT, vmcs12->guest_pat.full)) {
+			DPRINTF("%s: error writing Guest PAT\n", __func__);
+			return EINVAL;
+		}
+	}
+
+
+	//vmwrite(VMCS_ENTRY_MSR_LOAD_COUNT, 0);
+	if (vmwrite(VMCS_ENTRY_INTERRUPTION_INFO, vmcs12->entry_interruption_info)) {
+		DPRINTF("%s: error writing Entry Int. Info\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_ENTRY_EXCEPTION_ERROR_CODE, vmcs12->entry_exception_error_code)) {
+		DPRINTF("%s: error writing Entry Ex. Err Code\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_ENTRY_INSTRUCTION_LENGTH, vmcs12->entry_instruction_length)) {
+		DPRINTF("%s: error writing Entry Ex. Ins Len\n", __func__);
+		return EINVAL;
+	}
+	//vmwrite(VMCS_TPR_THRESHOLD, 0);
+	
+	if (vcpu_vmx_check_cap(vcpu, IA32_VMX_PROCBASED_CTLS,
+	    IA32_VMX_ACTIVATE_SECONDARY_CONTROLS, 1)) {
+		procbased2 = vcpu->vc_vmx_current_procbased2_ctls;
+		procbased2 &= ~IA32_VMX_VIRTUALIZE_APIC;
+
+		if (vmwrite(VMCS_PROCBASED2_CTLS, vcpu->vc_vmx_current_procbased2_ctls)) {
+			DPRINTF("%s: error writing 2ndary Procbased Ctrls\n", __func__);
+			return EINVAL;
+		}
+	}
+	//vmwrite(VMCS_PLE_GAP, 0);
+	//vmwrite(VMCS_PLE_WINDOW, 0);
+
+	//vmwrite(VMCS_INSTRUCTION_ERROR, 0);
+	//vmwrite(VMCS_EXIT_REASON, 0);
+	//vmwrite(VMCS_EXIT_INTERRUPTION_INFO, 0);
+	//vmwrite(VMCS_EXIT_INTERRUPTION_ERR_CODE, 0);
+	//vmwrite(VMCS_IDT_VECTORING_INFO, 0);
+	//vmwrite(VMCS_IDT_VECTORING_ERROR_CODE, 0);
+	//vmwrite(VMCS_INSTRUCTION_LENGTH, 0);
+	//vmwrite(VMCS_EXIT_INSTRUCTION_INFO, 0);
+
+	if (vmwrite(VMCS_GUEST_IA32_ES_LIMIT, vmcs12->guest_es_limit)) {
+		DPRINTF("%s: error writing Guest ES Limit\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_CS_LIMIT, vmcs12->guest_cs_limit)) {
+		DPRINTF("%s: error writing Guest CS Limit\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_SS_LIMIT, vmcs12->guest_ss_limit)) {
+		DPRINTF("%s: error writing Guest SS Limit\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_DS_LIMIT, vmcs12->guest_ds_limit)) {
+		DPRINTF("%s: error writing Guest DS Limit\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_FS_LIMIT, vmcs12->guest_fs_limit)) {
+		DPRINTF("%s: error writing Guest FS Limit\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_GS_LIMIT, vmcs12->guest_gs_limit)) {
+		DPRINTF("%s: error writing Guest GS Limit\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_LDTR_LIMIT, vmcs12->guest_ldtr_limit)) {
+		DPRINTF("%s: error writing Guest LDTR Limit\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_TR_LIMIT, vmcs12->guest_tr_limit)) {
+		DPRINTF("%s: error writing Guest TR Limit\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_GDTR_LIMIT, vmcs12->guest_gdtr_limit)) {
+		DPRINTF("%s: error writing Guest GDTR Limit\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_IDTR_LIMIT, vmcs12->guest_idtr_limit)) {
+		DPRINTF("%s: error writing Guest IDTR Limit\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_ES_AR, vmcs12->guest_es_ar)) {
+		DPRINTF("%s: error writing Guest ES AR\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_CS_AR, vmcs12->guest_cs_ar)) {
+		DPRINTF("%s: error writing Guest CS AR\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_SS_AR, vmcs12->guest_ss_ar)) {
+		DPRINTF("%s: error writing Guest SS AR\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_DS_AR, vmcs12->guest_ds_ar)) {
+		DPRINTF("%s: error writing Guest DS AR\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_FS_AR, vmcs12->guest_fs_ar)) {
+		DPRINTF("%s: error writing Guest FS AR\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_GS_AR, vmcs12->guest_gs_ar)) {
+		DPRINTF("%s: error writing Guest GS AR\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_LDTR_AR, vmcs12->guest_ldtr_ar)) {
+		DPRINTF("%s: error writing Guest LDTR AR\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_TR_AR, vmcs12->guest_tr_ar)) {
+		DPRINTF("%s: error writing Guest TR AR\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_INTERRUPTIBILITY_ST, vmcs12->guest_interruptibility_state)) {
+		DPRINTF("%s: error writing Guest Int. State\n", __func__);
+		return EINVAL;
+	}
+
+	//vmwrite(VMCS_GUEST_ACTIVITY_STATE, 0);
+	//vmwrite(VMCS_GUEST_SMBASE, 0);
+
+	if (vmwrite(VMCS_GUEST_IA32_SYSENTER_CS, vmcs12->guest_sysenter_cs)) {
+		DPRINTF("%s: error writing Guest SYSENTER CS\n", __func__);
+		return EINVAL;
+	}
+
+	//vmwrite(VMCS_VMX_PREEMPTION_TIMER_VAL, 0);
+
+	msr = rdmsr(MSR_SYSENTER_CS);
+	if (vmwrite(VMCS_HOST_IA32_SYSENTER_CS, msr)) {
+		DPRINTF("%s: error writing Host SYSENTER CS\n", __func__);
+		return EINVAL;
+	}
+
+	//vmwrite(VMCS_CR0_MASK, 0);
+	//vmwrite(VMCS_CR4_MASK, 0);
+	//vmwrite(VMCS_CR0_READ_SHADOW, 0);
+	//vmwrite(VMCS_CR4_READ_SHADOW, 0);
+	//vmwrite(VMCS_CR3_TARGET_0, 0);
+	//vmwrite(VMCS_CR3_TARGET_1, 0);
+	//vmwrite(VMCS_CR3_TARGET_2, 0);
+	//vmwrite(VMCS_CR3_TARGET_3, 0);
+
+	//vmwrite(VMCS_GUEST_EXIT_QUALIFICATION, 0);
+	//vmwrite(VMCS_IO_RCX, 0);
+	//vmwrite(VMCS_IO_RSI, 0);
+	//vmwrite(VMCS_IO_RDI, 0);
+	//vmwrite(VMCS_IO_RIP, 0);
+	//vmwrite(VMCS_GUEST_LINEAR_ADDRESS, 0);
+
+	//if ((vmcs12->guest_cr0 & vcpu->vc_vmx_cr0_fixed1) != vcpu->vc_vmx_cr0_fixed1) {
+		//DPRINTF("%s: Guest CR0 outside fixed1\n", __func__);
+		//return EINVAL;
+	//}
+
+	//if ((~vmcs12->guest_cr0 & vcpu->vc_vmx_cr0_fixed0) != vcpu->vc_vmx_cr0_fixed0) {
+		//DPRINTF("%s: Guest CR0 outside fixed0\n", __func__);
+		//return EINVAL;
+	//}
+
+	// XXX Paging?
+	if (vmwrite(VMCS_GUEST_IA32_CR0, vmcs12->guest_cr0)) {
+		DPRINTF("%s: error writing Guest CR0\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_CR3, vmcs12->guest_cr3)) {
+		DPRINTF("%s: error writing Guest CR3\n", __func__);
+		return EINVAL;
+	}
+	
+	// XXX Paging?
+	// XXX check nesting allowed
+	//if ((vmcs12->guest_cr4 & vcpu->vc_vmx_cr4_fixed1) != vcpu->vc_vmx_cr4_fixed1) {
+		//DPRINTF("%s: Guest CR4 outside fixed1\n", __func__);
+		//return EINVAL;
+	//}
+
+	//if ((~vmcs12->guest_cr4 & vcpu->vc_vmx_cr4_fixed0) != vcpu->vc_vmx_cr4_fixed0) {
+		//DPRINTF("%s: Guest CR4 outside fixed0\n", __func__);
+		//return EINVAL;
+	//}
+
+	if (vmwrite(VMCS_GUEST_IA32_CR4, vmcs12->guest_cr4)) {
+		DPRINTF("%s: error writing Guest CR4\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_ES_BASE, vmcs12->guest_es_base)) {
+		DPRINTF("%s: error writing Guest ES Base\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_CS_BASE, vmcs12->guest_cs_base)) {
+		DPRINTF("%s: error writing Guest CS Base\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_SS_BASE, vmcs12->guest_ss_base)) {
+		DPRINTF("%s: error writing Guest TR Base\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_DS_BASE, vmcs12->guest_ds_base)) {
+		DPRINTF("%s: error writing Guest DS Base\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_FS_BASE, vmcs12->guest_fs_base)) {
+		DPRINTF("%s: error writing Guest FS Base\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_GS_BASE, vmcs12->guest_gs_base)) {
+		DPRINTF("%s: error writing Guest GS Base\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_LDTR_BASE, vmcs12->guest_ldtr_base)) {
+		DPRINTF("%s: error writing Guest LDTR Base\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_TR_BASE, vmcs12->guest_tr_base)) {
+		DPRINTF("%s: error writing Guest TR Base\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_GDTR_BASE, vmcs12->guest_gdtr_base)) {
+		DPRINTF("%s: error writing Guest GDTR Base\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_IDTR_BASE, vmcs12->guest_idtr_base)) {
+		DPRINTF("%s: error writing Guest IDTR Base\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_DR7, vmcs12->guest_dr7)) {
+		DPRINTF("%s: error writing Guest DR7\n", __func__);
+		return EINVAL;
+	}
+
+	//vmwrite(VMCS_GUEST_IA32_RSP, 0);
+	//vmwrite(VMCS_GUEST_IA32_RIP, 0);
+	if (vmwrite(VMCS_GUEST_IA32_RFLAGS, vmcs12->guest_rflags)) {
+		DPRINTF("%s: error writing Guest RFLAGS\n", __func__);
+		return EINVAL;
+	}
+	
+	if (vmwrite(VMCS_GUEST_PENDING_DBG_EXC, vmcs12->guest_pending_debug_exceptions)) {
+		DPRINTF("%s: error writing Guest Pend Dbg Exc\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_SYSENTER_ESP, vmcs12->guest_sysenter_esp)) {
+		DPRINTF("%s: error writing Guest SYSENTER ESP\n", __func__);
+		return EINVAL;
+	}
+
+	if (vmwrite(VMCS_GUEST_IA32_SYSENTER_EIP, vmcs12->guest_sysenter_eip)) {
+		DPRINTF("%s: error writing Guest SYSENTER EIP\n", __func__);
+		return EINVAL;
+	}
+
+
+	cr0 = rcr0() & ~CR0_TS;
+	if (vmwrite(VMCS_HOST_IA32_CR0, cr0)) {
+		DPRINTF("%s: error writing host CR0\n", __func__);
+		return EINVAL;
+	}
+
+	cr3 = rcr3();
+	if (vmwrite(VMCS_HOST_IA32_CR3, cr3)) {
+		DPRINTF("%s: error writing host CR3\n", __func__);
+		return EINVAL;
+	}
+
+	cr4 = rcr4();
+	if (vmwrite(VMCS_HOST_IA32_CR4, cr4)) {
+		DPRINTF("%s: error writing host CR3\n", __func__);
+		return EINVAL;
+	}
+
+	//vmwrite(VMCS_HOST_IA32_FS_BASE, 0);
+	//vmwrite(VMCS_HOST_IA32_GS_BASE, 0);
+	//vmwrite(VMCS_HOST_IA32_TR_BASE, 0);
+	//vmwrite(VMCS_HOST_IA32_GDTR_BASE, 0);
+	//vmwrite(VMCS_HOST_IA32_IDTR_BASE, 0);
+	//vmwrite(VMCS_HOST_IA32_SYSENTER_ESP, 0);
+	
+	msr = rdmsr(MSR_SYSENTER_EIP);
+	if (vmwrite(VMCS_HOST_IA32_SYSENTER_EIP, 0)) {
+		DPRINTF("%s: error writing host SYSENTER EIP\n", __func__);
+	}
+
+	printf("%s: nested vmlaunch/vmresume success!!\n", __func__);
+	// XXX set in vmx_enter_guest
+	//vmwrite(VMCS_HOST_IA32_RSP, 0);
+
+	// XXX set in vmx_enter_guest
+	//vmwrite(VMCS_HOST_IA32_RIP, 0);
+
+	return 0;
 }
 
 /*
@@ -8329,7 +8967,7 @@ vmx_handle_vmread(struct vcpu *vcpu)
 		*(uint32_t *)rsi = vmcs->tpr_threshold;
 		break;
 	case VMCS_PROCBASED2_CTLS:
-		*(uint32_t *)rsi = vmcs->tpr_threshold;
+		*(uint32_t *)rsi = vmcs->secondary_procbased_ctrls;
 		break;
 	case VMCS_PLE_GAP:
 		*(uint32_t *)rsi = vmcs->ple_gap;
@@ -8974,7 +9612,7 @@ vmx_handle_vmwrite(struct vcpu *vcpu)
 	case VMCS_PROCBASED2_CTLS:
 		DPRINTF("%s: set nested procbased2 ctrls 0x%llx\n", __func__,
 		    (uint64_t)rsi);
-		vmcs->tpr_threshold = (uint32_t)rsi;
+		vmcs->secondary_procbased_ctrls = (uint32_t)rsi;
 		break;
 	case VMCS_PLE_GAP:
 		vmcs->ple_gap = (uint32_t)rsi;

@@ -130,7 +130,7 @@ ns8250_init(int fd, uint32_t vmid)
 	 * (and parity, stop bits, etc) and simply assume each character
 	 * output is 8 bits.
 	 */
-	com1_dev.pause_ct = 0xFFFFFFFF;
+	com1_dev.pause_ct = (com1_dev.baudrate / 8) / 1000 * 10;
 
 	event_set(&com1_dev.event, com1_dev.fd, EV_READ | EV_PERSIST,
 	    com_rcv_event, (void *)(intptr_t)vmid);
@@ -382,7 +382,7 @@ vcpu_process_com_lcr(struct vm_exit *vei)
 					     com1_dev.regs.divhi << 8;
 					com1_dev.baudrate = 115200 / divisor;
 					com1_dev.pause_ct =
-					    0xFFFFFFFF;
+					    (com1_dev.baudrate / 8) / 1000 * 10;
 				}
 
 				log_debug("%s: set baudrate = %d", __func__,
@@ -694,9 +694,7 @@ ns8250_restore(int fd, int con_fd, uint32_t vmid)
 	com1_dev.byte_out = 0;
 	com1_dev.regs.divlo = 1;
 	com1_dev.baudrate = 115200;
-	com1_dev.rate_tv.tv_usec = 10000;
 	com1_dev.pause_ct = (com1_dev.baudrate / 8) / 1000 * 10;
-	evtimer_set(&com1_dev.rate, ratelimit, NULL);
 
 	event_set(&com1_dev.event, com1_dev.fd, EV_READ | EV_PERSIST,
 	    com_rcv_event, (void *)(intptr_t)vmid);
