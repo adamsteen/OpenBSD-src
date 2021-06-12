@@ -7875,7 +7875,6 @@ vmx_handle_vmlaunch_vmresume(struct vcpu *vcpu, int resume)
 
 	// XXX check error handling
 
-	printf("%s: start vmlaunch/vmresume!!\n", __func__);
 	/*
 	 * Clear VMCS02 it may have been used by a different nested vm
 	 */
@@ -8304,15 +8303,18 @@ vmx_handle_vmlaunch_vmresume(struct vcpu *vcpu, int resume)
 	//vmwrite(VMCS_IO_RIP, 0);
 	//vmwrite(VMCS_GUEST_LINEAR_ADDRESS, 0);
 
-	//if ((vmcs12->guest_cr0 & vcpu->vc_vmx_cr0_fixed1) != vcpu->vc_vmx_cr0_fixed1) {
-		//DPRINTF("%s: Guest CR0 outside fixed1\n", __func__);
-		//return EINVAL;
-	//}
+	if (vcpu->vc_vmx_cr0_fixed1 & CR0_NE)
+		vmcs12->guest_cr0 |= CR0_NE;
 
-	//if ((~vmcs12->guest_cr0 & vcpu->vc_vmx_cr0_fixed0) != vcpu->vc_vmx_cr0_fixed0) {
-		//DPRINTF("%s: Guest CR0 outside fixed0\n", __func__);
-		//return EINVAL;
-	//}
+	if ((vmcs12->guest_cr0 & vcpu->vc_vmx_cr0_fixed1) != vcpu->vc_vmx_cr0_fixed1) {
+		DPRINTF("%s: Guest CR0 outside fixed1\n", __func__);
+		return EINVAL;
+	}
+
+	if ((~vmcs12->guest_cr0 & vcpu->vc_vmx_cr0_fixed0) != vcpu->vc_vmx_cr0_fixed0) {
+		DPRINTF("%s: Guest CR0 outside fixed0\n", __func__);
+		return EINVAL;
+	}
 
 	// XXX Paging?
 	if (vmwrite(VMCS_GUEST_IA32_CR0, vmcs12->guest_cr0)) {
@@ -8327,15 +8329,15 @@ vmx_handle_vmlaunch_vmresume(struct vcpu *vcpu, int resume)
 	
 	// XXX Paging?
 	// XXX check nesting allowed
-	//if ((vmcs12->guest_cr4 & vcpu->vc_vmx_cr4_fixed1) != vcpu->vc_vmx_cr4_fixed1) {
-		//DPRINTF("%s: Guest CR4 outside fixed1\n", __func__);
-		//return EINVAL;
-	//}
+	if ((vmcs12->guest_cr4 & vcpu->vc_vmx_cr4_fixed1) != vcpu->vc_vmx_cr4_fixed1) {
+		DPRINTF("%s: Guest CR4 outside fixed1\n", __func__);
+		return EINVAL;
+	}
 
-	//if ((~vmcs12->guest_cr4 & vcpu->vc_vmx_cr4_fixed0) != vcpu->vc_vmx_cr4_fixed0) {
-		//DPRINTF("%s: Guest CR4 outside fixed0\n", __func__);
-		//return EINVAL;
-	//}
+	if ((~vmcs12->guest_cr4 & vcpu->vc_vmx_cr4_fixed0) != vcpu->vc_vmx_cr4_fixed0) {
+		DPRINTF("%s: Guest CR4 outside fixed0\n", __func__);
+		return EINVAL;
+	}
 
 	if (vmwrite(VMCS_GUEST_IA32_CR4, vmcs12->guest_cr4)) {
 		DPRINTF("%s: error writing Guest CR4\n", __func__);
@@ -8450,7 +8452,6 @@ vmx_handle_vmlaunch_vmresume(struct vcpu *vcpu, int resume)
 		DPRINTF("%s: error writing host SYSENTER EIP\n", __func__);
 	}
 
-	printf("%s: nested vmlaunch/vmresume success!!\n", __func__);
 	// XXX set in vmx_enter_guest
 	//vmwrite(VMCS_HOST_IA32_RSP, 0);
 
